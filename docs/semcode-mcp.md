@@ -11,7 +11,8 @@ function names, commit messages, symbols, and lore email searches.
 - **git_sha**: commit to search (default: current)
 - **branch**: branch name, resolved to its tip (e.g., "main"); takes
   precedence over git_sha if both are given
-- **page**: pagination (1-based), 50 lines per page; omit for full results
+- **page**: pagination (1-based); pages are 50 lines of the tool's
+  rendered text output, not 50 result records.  Omit for full results.
 - **since_date / until_date**: e.g., "yesterday", "2 weeks ago",
   "2024-01-15"
 - **\*_patterns**: arrays of regex.  `author_patterns`, `subject_patterns`,
@@ -20,27 +21,32 @@ function names, commit messages, symbols, and lore email searches.
   `regex_patterns` and `symbol_patterns` are AND'd within an array.
 
 **Conventions**: boolean parameters default to `false`; `limit: 0`
-means unlimited unless a max is given.
+means unlimited, except where the tool declares an explicit max --
+in that case the max wins and `limit: 0` is rejected.
 
 ## Code lookup
+
+In the call-graph tools below (`find_callers`, `find_calls`,
+`find_callchain`), both sides of a call edge include functions and
+function-like macros.
 
 **find_function**: search for functions and macros
   - name: function/macro name, or a regex
   - also displays details on callers and callees
 **find_type**: search for types and typedefs
   - name: type/typedef name or regex
-**find_callers**: find all functions that call a function or macro
-  - name: function to search
-**find_calls**: find all functions called by a function or macro
-  - name: function to search
-**find_callchain**: search complete function/macro call chain (forward and reverse)
+**find_callers**: find callers (functions or macros) of the named entity
+  - name: function or macro to search
+**find_calls**: find callees (functions or macros) of the named entity
+  - name: function or macro to search
+**find_callchain**: complete call chain (forward and reverse)
   - name: function or macro to search
   - up_levels: number of caller levels to show (default: 2, 0 = unlimited)
   - down_levels: number of callee levels to show (default: 3, 0 = unlimited)
   - calls_limit: max calls to show per level (default: 15, 0 = unlimited)
 **diff_functions**: extract functions and types from a unified diff
-  - diff_content: the string to analyze
-  - Use this to determine which symbols are involved in a given diff
+  - diff_content: unified diff text (e.g., output of `git diff`)
+  - use this to determine which symbols are involved in a given diff
 
 ## Code search
 
@@ -49,8 +55,9 @@ means unlimited unless a max is given.
   - verbose: if true, show full function bodies
   - path_pattern: optional regex to filter results by path
   - limit: max number of results (default: 100)
-  - only searches inside functions or macros; no need to escape
-    your pattern to limit the search
+  - the search is already scoped to function and macro bodies; no
+    need to anchor the pattern to constrain the search (regex
+    metacharacters are NOT auto-escaped)
 **vgrep_functions**: vector embedding search on functions/macros/types
   - query_text: text describing the kind of functions to find
   - path_pattern: optional regex to filter results by path
@@ -60,30 +67,39 @@ means unlimited unless a max is given.
 
 ## Commit search
 
-In both tools below, `reachable_sha` and `git_range` are mutually
-exclusive.  To search commits reachable from HEAD, pass
-`reachable_sha=HEAD` alone.
+Note: commit tools use **`git_ref`** (not `git_sha` from the common
+parameters) and **`symbol_patterns`** (singular; AND'd -- distinct
+from lore's plural `symbols_patterns`, which is OR'd).  They do not
+accept `since_date`/`until_date`; those date filters are lore-only.
+
+Commit selection in `find_commit`: `git_ref` and `git_range` are
+mutually exclusive.  `reachable_sha` is a filter that may accompany
+either, or stand alone (with no `git_ref` or `git_range`) to mean
+"all indexed commits reachable from this sha".
 
 **find_commit**: search for changes, potentially in a range of commits
   - can return a large body of results; use pagination to manage context
   - git_ref: single commit ref (sha, short sha, branch, HEAD, etc.)
-  - git_range: optional range for multiple commits, e.g., HEAD~10..HEAD;
-    cannot be combined with git_ref
+  - git_range: optional range for multiple commits, e.g., HEAD~10..HEAD
   - reachable_sha: optional git sha; filter to results reachable from it
-  - regex_patterns: applied against commit message + unified diff
-  - symbol_patterns: find commits changing a function or type
+  - regex_patterns (AND'd): applied against commit message + unified diff
+  - symbol_patterns (AND'd): find commits changing a function or type
+  - author_patterns, subject_patterns, path_patterns (each OR'd)
   - verbose: show full diff in addition to metadata
-  - accepts: author_patterns, subject_patterns, path_patterns
 **vcommit_similar_commits**: search commits based on vector embeddings
   - query_text: search text
   - git_range: optional range, e.g., HEAD~10..HEAD
-  - reachable_sha: optional git sha, reachable-from filter
-  - regex_patterns: AND'd to limit results
-  - symbol_patterns: AND'd to limit results by symbols changed
+  - reachable_sha: optional git sha, reachable-from filter (combinable
+    with git_range)
+  - regex_patterns (AND'd), symbol_patterns (AND'd)
+  - author_patterns, subject_patterns, path_patterns (each OR'd)
   - limit: max results (default 10, max 50)
-  - accepts: author_patterns, subject_patterns, path_patterns
 
 ## Lore (kernel mailing list archive)
+
+Lore tools use **`symbols_patterns`** (plural; OR'd within the array --
+distinct from commit tools' singular `symbol_patterns`, which is AND'd).
+All `*_patterns` arrays below are OR'd within the array.
 
 **lore_search**: search lore.kernel.org email archives
   - message_id: optional exact message ID for direct lookup
@@ -96,7 +112,8 @@ exclusive.  To search commits reachable from HEAD, pass
   - accepts: from_patterns, subject_patterns, body_patterns,
     symbols_patterns, recipients_patterns
 **dig**: find lore.kernel.org emails related to a git commit
-  - commit: git commit reference (SHA, short SHA, HEAD, branch name, etc.)
+  - commit (required): git commit reference (SHA, short SHA, HEAD,
+    branch name, etc.)
   - verbose: show full message body
   - show_all: show all duplicate results, not just most recent
   - show_thread: show full thread for each result (use with show_all)
@@ -129,13 +146,15 @@ and invoke full tools on demand.
 
 ## Recipes
 
-### Searching for commits reachable from HEAD (or any other git sha)
+### Locating a backported commit reachable from HEAD (or any other sha)
 
-If a repository heavily cherry-picks patches, it might have a backported commit
-under a different git sha.  This means the most effective way to find the
-backported commit is searching by commit subject:
+Repositories that heavily cherry-pick patches store the backport
+under a different git sha than the upstream commit.  Search by
+commit subject to find it, then narrow to commits reachable from
+the branch tip with `reachable_sha`:
 
 ```
-semcode> commit -r "bnxt_en: Fix memory corruption when FW resources change during ifdown"
-semcode> commit -r "bnxt_en: Fix memory corruption when FW resources change during ifdown" --reachable HEAD
+find_commit(regex_patterns=["bnxt_en: Fix memory corruption when FW resources change during ifdown"])
+find_commit(regex_patterns=["bnxt_en: Fix memory corruption when FW resources change during ifdown"],
+            reachable_sha="HEAD")
 ```
