@@ -5683,40 +5683,23 @@ mod tests {
     use clap::Parser;
     use std::env;
 
+    // Combined into a single test so the three cases don't race on the
+    // process-wide SEMCODE_GIT_REPO env var when cargo runs tests in parallel.
     #[test]
-    fn test_git_repo_env_var() {
+    fn test_git_repo_arg_env_default() {
         let key = "SEMCODE_GIT_REPO";
-        let value = "/tmp/test_repo_mcp";
-        env::set_var(key, value);
 
-        // No arguments provided, should use env var
-        let args = Args::try_parse_from(&["semcode-mcp"]).unwrap();
-        assert_eq!(args.git_repo, value);
+        env::set_var(key, "/tmp/test_repo_mcp");
+        let args = Args::try_parse_from(["semcode-mcp"]).unwrap();
+        assert_eq!(args.git_repo, "/tmp/test_repo_mcp");
+
+        env::set_var(key, "/tmp/env_repo_mcp");
+        let args =
+            Args::try_parse_from(["semcode-mcp", "--git-repo", "/tmp/arg_repo_mcp"]).unwrap();
+        assert_eq!(args.git_repo, "/tmp/arg_repo_mcp");
 
         env::remove_var(key);
-    }
-
-    #[test]
-    fn test_git_repo_priority() {
-        let key = "SEMCODE_GIT_REPO";
-        let env_value = "/tmp/env_repo_mcp";
-        let arg_value = "/tmp/arg_repo_mcp";
-        env::set_var(key, env_value);
-
-        // Argument should take priority over env var
-        let args = Args::try_parse_from(&["semcode-mcp", "--git-repo", arg_value]).unwrap();
-        assert_eq!(args.git_repo, arg_value);
-
-        env::remove_var(key);
-    }
-
-    #[test]
-    fn test_git_repo_default() {
-        let key = "SEMCODE_GIT_REPO";
-        env::remove_var(key);
-
-        // No arguments and no env var, should use default
-        let args = Args::try_parse_from(&["semcode-mcp"]).unwrap();
+        let args = Args::try_parse_from(["semcode-mcp"]).unwrap();
         assert_eq!(args.git_repo, ".");
     }
 
