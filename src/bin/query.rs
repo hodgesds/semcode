@@ -82,32 +82,6 @@ struct Args {
     git_only: bool,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use clap::Parser;
-    use std::env;
-
-    // Combined into a single test so the three cases don't race on the
-    // process-wide SEMCODE_GIT_REPO env var when cargo runs tests in parallel.
-    #[test]
-    fn test_git_repo_arg_env_default() {
-        let key = "SEMCODE_GIT_REPO";
-
-        env::set_var(key, "/tmp/test_repo");
-        let args = Args::try_parse_from(["query"]).unwrap();
-        assert_eq!(args.git_repo, "/tmp/test_repo");
-
-        env::set_var(key, "/tmp/env_repo");
-        let args = Args::try_parse_from(["query", "--git-repo", "/tmp/arg_repo"]).unwrap();
-        assert_eq!(args.git_repo, "/tmp/arg_repo");
-
-        env::remove_var(key);
-        let args = Args::try_parse_from(["query"]).unwrap();
-        assert_eq!(args.git_repo, ".");
-    }
-}
-
 /// Check if the current commit needs indexing and perform incremental indexing if needed
 async fn index_current_commit_if_needed(
     db_manager: Arc<DatabaseManager>,
@@ -579,4 +553,30 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+    use std::env;
+
+    // Combined into a single test so the three cases don't race on the
+    // process-wide SEMCODE_GIT_REPO env var when cargo runs tests in parallel.
+    #[test]
+    fn test_git_repo_arg_env_default() {
+        let key = "SEMCODE_GIT_REPO";
+
+        env::set_var(key, "/tmp/test_repo");
+        let args = Args::try_parse_from(["query"]).unwrap();
+        assert_eq!(args.git_repo, "/tmp/test_repo");
+
+        env::set_var(key, "/tmp/env_repo");
+        let args = Args::try_parse_from(["query", "--git-repo", "/tmp/arg_repo"]).unwrap();
+        assert_eq!(args.git_repo, "/tmp/arg_repo");
+
+        env::remove_var(key);
+        let args = Args::try_parse_from(["query"]).unwrap();
+        assert_eq!(args.git_repo, ".");
+    }
 }
