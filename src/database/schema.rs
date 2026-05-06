@@ -1199,7 +1199,7 @@ impl SchemaManager {
         let skipped = tables_skipped.load(Ordering::Relaxed);
         let failed = tables_failed.load(Ordering::Relaxed);
 
-        println!(
+        tracing::info!(
             "    Optimized {} tables{}{}",
             optimized,
             if skipped > 0 {
