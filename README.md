@@ -85,6 +85,15 @@ cargo build --release
 
 Binaries end up in target/release
 
+### (Optional) Installation
+
+Install to your ~/.cargo/bin (if specified in your $SHELL profile)
+
+```bash
+# From the root of the semcode repository
+cargo install --path .
+```
+
 ### Basic Usage
 
 ```bash
