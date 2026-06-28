@@ -2718,12 +2718,16 @@ impl McpServer {
             "tools/list" => self.handle_list_tools().await,
             "tools/call" => self.handle_tool_call(params).await,
             "ping" => json!({}),
-            _ => json!({
-                "error": {
-                    "code": -32601,
-                    "message": "Method not found"
-                }
-            }),
+            _ => {
+                return json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": {
+                        "code": -32601,
+                        "message": "Method not found"
+                    }
+                });
+            }
         };
 
         json!({
