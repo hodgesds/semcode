@@ -3964,7 +3964,7 @@ fn show_commit_summary(params: &CommitSummaryParams) {
             );
         } else if !params.path_patterns.is_empty() {
             println!(
-                "\n{} No commits matched ALL {} path pattern(s): {}",
+                "\n{} No commits matched ANY {} path pattern(s): {}",
                 "Info:".yellow(),
                 params.path_patterns.len(),
                 params.path_patterns.join(", ")
