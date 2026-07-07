@@ -2796,11 +2796,8 @@ impl VectorSearchManager {
         let mut temp_stream = lore_table.query().execute().await?;
         while let Some(batch) = temp_stream.try_next().await? {
             total_emails += batch.num_rows();
-            let message_id_array = batch
-                .column(4)
-                .as_any()
-                .downcast_ref::<arrow::array::StringArray>()
-                .unwrap();
+            let message_id_array: &arrow::array::StringArray =
+                super::get_column(&batch, "message_id")?;
             for i in 0..batch.num_rows() {
                 if !existing_message_ids.contains(message_id_array.value(i)) {
                     emails_needing_vectors += 1;
@@ -2908,31 +2905,16 @@ impl VectorSearchManager {
                             let vectors =
                                 tokio::task::spawn_blocking(move || -> Result<Vec<VectorEntry>> {
                                     // Extract email data from RecordBatch
-                                    let message_id_array = record_batch
-                                        .column(4)
-                                        .as_any()
-                                        .downcast_ref::<arrow::array::StringArray>()
-                                        .unwrap();
-                                    let from_array = record_batch
-                                        .column(1)
-                                        .as_any()
-                                        .downcast_ref::<arrow::array::StringArray>()
-                                        .unwrap();
-                                    let subject_array = record_batch
-                                        .column(6)
-                                        .as_any()
-                                        .downcast_ref::<arrow::array::StringArray>()
-                                        .unwrap();
-                                    let recipients_array = record_batch
-                                        .column(8)
-                                        .as_any()
-                                        .downcast_ref::<arrow::array::StringArray>()
-                                        .unwrap();
-                                    let body_array = record_batch
-                                        .column(10)
-                                        .as_any()
-                                        .downcast_ref::<arrow::array::StringArray>()
-                                        .unwrap();
+                                    let message_id_array: &arrow::array::StringArray =
+                                        super::get_column(&record_batch, "message_id")?;
+                                    let from_array: &arrow::array::StringArray =
+                                        super::get_column(&record_batch, "from")?;
+                                    let subject_array: &arrow::array::StringArray =
+                                        super::get_column(&record_batch, "subject")?;
+                                    let recipients_array: &arrow::array::StringArray =
+                                        super::get_column(&record_batch, "recipients")?;
+                                    let body_array: &arrow::array::StringArray =
+                                        super::get_column(&record_batch, "body")?;
 
                                     // Extract emails that need vectorization
                                     let mut emails_to_vectorize = Vec::new();
@@ -3036,13 +3018,13 @@ impl VectorSearchManager {
         // Workers will finish when work_rx is closed and they've processed all batches
         // Inserter will finish when result_rx is closed and all results are inserted
 
-        // Just wait for workers to complete (reader runs in parallel)
-        tokio::spawn(reader_task);
-
         // Wait for all workers to finish processing
         for handle in worker_handles {
             handle.await??;
         }
+
+        // Surface reader errors after workers have drained the work queue.
+        reader_task.await??;
 
         // Drop result_tx to signal completion to insertion task
         drop(result_tx);
