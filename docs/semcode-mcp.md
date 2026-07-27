@@ -7,6 +7,8 @@ commit.  You can also pass a specific commit you're interested in, or a branch n
 
 **Branch Support**: Most query tools support a `branch` parameter as an alternative to `git_sha`. When you specify a branch name (e.g., "main", "develop"), it will be resolved to the current tip commit of that branch. Branch takes precedence over git_sha if both are provided.
 
+**Multiple Repositories**: This server may serve several repositories at once. Call `list_repositories` to see their names and paths. Every query tool accepts an optional `repository` parameter to target one explicitly. If you don't set it, the server routes by any path argument you pass (to the repository whose working tree contains that path), and otherwise uses the default repository. The symbol-lookup tools (`find_function`, `find_type`, `find_callers`, `find_calls`, `find_callchain`) additionally accept a `repositories` list (e.g. `["narf","systemd"]`) to search several repositories at once and return results labeled by repository. When you pass none of these, unscoped symbol lookups use the server's configured default search set (shown by `list_repositories`).
+
 **find_function**: search for functions and macros
   - git_sha: indicates which commit to search (default: current)
   - branch: branch name to search (alternative to git_sha, e.g., "main", "develop")

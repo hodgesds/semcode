@@ -1824,6 +1824,54 @@ struct Args {
     /// Enable lazy tool loading (reduces initial context by ~96%)
     #[arg(long, default_value = "false")]
     lazy: bool,
+
+    /// Path to a JSON config file describing multiple repositories to serve.
+    /// When provided, --database/--git-repo are ignored.
+    #[arg(long, env = "SEMCODE_MCP_CONFIG")]
+    config: Option<String>,
+}
+
+/// One repository entry in the MCP server config file.
+#[derive(Debug, serde::Deserialize)]
+struct RepoConfig {
+    /// Stable name used to select this repository in tool calls.
+    name: String,
+    /// Path to the git working tree.
+    path: String,
+    /// Explicit database path. Defaults to `<path>/.semcode.db` when omitted.
+    #[serde(default)]
+    database: Option<String>,
+    /// Optional source URL (e.g. git remote) for display/identification.
+    #[serde(default)]
+    source_url: Option<String>,
+}
+
+/// MCP server config file: a set of repositories plus routing defaults.
+#[derive(Debug, serde::Deserialize)]
+struct ServerConfig {
+    /// Name of the default repository; defaults to the first entry. Used by
+    /// single-repository tools and as the final routing fallback.
+    #[serde(default)]
+    default: Option<String>,
+    /// Repositories searched by symbol lookups when a call selects none (no
+    /// `repositories`/`repository` argument, no path match). Omitted or empty
+    /// means just the default repository; list several names to search a set.
+    #[serde(default)]
+    default_repositories: Option<Vec<String>>,
+    repositories: Vec<RepoConfig>,
+}
+
+impl ServerConfig {
+    fn load(path: &str) -> Result<Self> {
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| anyhow::anyhow!("Failed to read config '{}': {}", path, e))?;
+        let cfg: ServerConfig = serde_json::from_str(&text)
+            .map_err(|e| anyhow::anyhow!("Failed to parse config '{}': {}", path, e))?;
+        if cfg.repositories.is_empty() {
+            anyhow::bail!("Config '{}' defines no repositories", path);
+        }
+        Ok(cfg)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1937,7 +1985,7 @@ struct ToolCategory {
     tool_names: &'static [&'static str],
 }
 
-/// Tool categories for lazy loading - groups the 16 tools into logical categories
+/// Tool categories for lazy loading - groups the tools into logical categories
 const TOOL_CATEGORIES: &[ToolCategory] = &[
     ToolCategory {
         name: "code_lookup",
@@ -1973,14 +2021,58 @@ const TOOL_CATEGORIES: &[ToolCategory] = &[
     },
     ToolCategory {
         name: "status",
-        description: "System status - check background indexing progress",
-        tool_names: &["indexing_status"],
+        description: "System status - check background indexing progress and list configured repositories",
+        tool_names: &["indexing_status", "list_repositories"],
     },
 ];
 
 /// Get the JSON schema for a specific tool by name
 fn get_tool_schema(name: &str) -> Option<Value> {
+    let mut schema = raw_tool_schema(name)?;
+    // Every repository-scoped tool accepts an optional `repository` selector so a
+    // caller can target one of several configured repositories explicitly.
+    if let Some(props) = schema
+        .get_mut("inputSchema")
+        .and_then(|s| s.get_mut("properties"))
+        .and_then(|p| p.as_object_mut())
+    {
+        props.insert(
+            "repository".to_string(),
+            json!({
+                "type": "string",
+                "description": "Optional repository name to target when several are configured (see list_repositories). Defaults to auto-detection from a path argument, then the default repository."
+            }),
+        );
+        // Symbol lookups can search several repositories at once; expose a
+        // `repositories` list to scope the search to a chosen subset.
+        if matches!(
+            name,
+            "find_function" | "find_type" | "find_callers" | "find_calls" | "find_callchain"
+        ) {
+            props.insert(
+                "repositories".to_string(),
+                json!({
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Optional list of repository names to search together, merging results labeled by repository. Overrides `repository` and the server's default search set. See list_repositories."
+                }),
+            );
+        }
+    }
+    Some(schema)
+}
+
+fn raw_tool_schema(name: &str) -> Option<Value> {
     match name {
+        "list_repositories" => Some(json!({
+            "name": "list_repositories",
+            "description": "List the repositories this server can query, including their name, path, source URL, and which is the default.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }
+        })),
         "find_rust_symbol" => Some(json!({
             "name": "find_rust_symbol",
             "description": "Find a rust symbol using rust-analyzer's exact type-inference. Only available in rust projects.",
@@ -2563,6 +2655,7 @@ fn get_all_tool_schemas() -> Vec<Value> {
         "indexing_status",
         "list_branches",
         "compare_branches",
+        "list_repositories",
     ];
     tool_names
         .iter()
@@ -2585,10 +2678,17 @@ struct Repository {
     root_path: std::path::PathBuf,
     /// HEAD SHA resolved at startup (None when not a git repository).
     default_git_sha: Option<String>,
+    /// Optional source URL (e.g. git remote) for display/identification.
+    source_url: Option<String>,
 }
 
 impl Repository {
-    async fn new(name: String, database_path: &str, git_repo_path: &str) -> Result<Arc<Self>> {
+    async fn new(
+        name: String,
+        database_path: &str,
+        git_repo_path: &str,
+        source_url: Option<String>,
+    ) -> Result<Arc<Self>> {
         let db_manager = DatabaseManager::new(database_path, git_repo_path.to_string()).await?;
         let db = Arc::new(db_manager);
 
@@ -2620,12 +2720,17 @@ impl Repository {
         let root_path = std::fs::canonicalize(git_repo_path)
             .unwrap_or_else(|_| std::path::PathBuf::from(git_repo_path));
 
+        if let Some(url) = &source_url {
+            eprintln!("[{name}] Source URL: {url}");
+        }
+
         Ok(Arc::new(Self {
             name,
             db,
             git_repo_path: git_repo_path.to_string(),
             root_path,
             default_git_sha,
+            source_url,
         }))
     }
 
@@ -2695,6 +2800,9 @@ struct McpServer {
     repositories: Vec<Arc<Repository>>,
     /// Index into `repositories` used when a tool call doesn't select one.
     default_repo: usize,
+    /// Indices into `repositories` searched by symbol lookups when a call selects
+    /// no repository. Defaults to just `[default_repo]`.
+    default_search: Vec<usize>,
     model_path: Option<String>,
     page_cache: PageCache,
     indexing_state: Arc<tokio::sync::Mutex<IndexingState>>,
@@ -2709,10 +2817,77 @@ impl McpServer {
         model_path: Option<String>,
         lazy_mode: bool,
     ) -> Result<Self> {
-        let repo = Repository::new("default".to_string(), database_path, git_repo_path).await?;
+        let repo =
+            Repository::new("default".to_string(), database_path, git_repo_path, None).await?;
         Ok(Self::with_repositories(
             vec![repo],
             0,
+            vec![0],
+            model_path,
+            lazy_mode,
+        ))
+    }
+
+    /// Build a server from a parsed config file describing multiple repositories.
+    async fn from_config(
+        cfg: ServerConfig,
+        model_path: Option<String>,
+        lazy_mode: bool,
+    ) -> Result<Self> {
+        let mut repositories = Vec::with_capacity(cfg.repositories.len());
+        for rc in &cfg.repositories {
+            let db_path = rc.database.clone().unwrap_or_else(|| {
+                std::path::Path::new(&rc.path)
+                    .join(".semcode.db")
+                    .to_string_lossy()
+                    .into_owned()
+            });
+            eprintln!("[{}] Database: {} (repo: {})", rc.name, db_path, rc.path);
+            let repo =
+                Repository::new(rc.name.clone(), &db_path, &rc.path, rc.source_url.clone()).await?;
+            repositories.push(repo);
+        }
+
+        // Resolve the default repository by name, falling back to the first entry.
+        let default_repo = cfg
+            .default
+            .as_ref()
+            .and_then(|name| repositories.iter().position(|r| &r.name == name))
+            .unwrap_or(0);
+        if let Some(name) = &cfg.default {
+            if !repositories.iter().any(|r| &r.name == name) {
+                eprintln!("Warning: default repository '{name}' not found; using first entry");
+            }
+        }
+
+        // Resolve the default symbol-lookup search set. Unknown names are warned
+        // about and skipped; an empty/omitted set falls back to the default repo.
+        let default_search: Vec<usize> = cfg
+            .default_repositories
+            .as_ref()
+            .map(|names| {
+                names
+                    .iter()
+                    .filter_map(|name| {
+                        let idx = repositories.iter().position(|r| &r.name == name);
+                        if idx.is_none() {
+                            eprintln!("Warning: default_repositories names unknown repo '{name}'");
+                        }
+                        idx
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let default_search = if default_search.is_empty() {
+            vec![default_repo]
+        } else {
+            default_search
+        };
+
+        Ok(Self::with_repositories(
+            repositories,
+            default_repo,
+            default_search,
             model_path,
             lazy_mode,
         ))
@@ -2722,12 +2897,14 @@ impl McpServer {
     fn with_repositories(
         repositories: Vec<Arc<Repository>>,
         default_repo: usize,
+        default_search: Vec<usize>,
         model_path: Option<String>,
         lazy_mode: bool,
     ) -> Self {
         Self {
             repositories,
             default_repo,
+            default_search,
             model_path,
             page_cache: PageCache::new(),
             indexing_state: Arc::new(tokio::sync::Mutex::new(IndexingState::new())),
@@ -2759,39 +2936,145 @@ impl McpServer {
             .cloned()
     }
 
-    /// Pick the repository for a tool call.
+    /// Repository named by an explicit `repository` argument, if valid.
+    fn repository_by_name_arg(&self, args: &Value) -> Option<Arc<Repository>> {
+        let name = args.get("repository").and_then(|v| v.as_str())?;
+        match self.repositories.iter().find(|r| r.name == name) {
+            Some(repo) => Some(repo.clone()),
+            None => {
+                eprintln!("Warning: unknown repository '{name}'");
+                None
+            }
+        }
+    }
+
+    /// Repository inferred from a path-bearing argument, if any matches.
+    fn repository_from_path_args(&self, args: &Value) -> Option<Arc<Repository>> {
+        for key in ["path", "file", "file_path", "path_pattern"] {
+            if let Some(repo) = args
+                .get(key)
+                .and_then(|v| v.as_str())
+                .and_then(|p| self.repository_for_path(p))
+            {
+                return Some(repo);
+            }
+        }
+        if let Some(arr) = args.get("path_patterns").and_then(|v| v.as_array()) {
+            for v in arr {
+                if let Some(repo) = v.as_str().and_then(|p| self.repository_for_path(p)) {
+                    return Some(repo);
+                }
+            }
+        }
+        None
+    }
+
+    /// Pick a single repository for a tool call.
     ///
     /// Resolution order: an explicit `repository` name argument, then a path-bearing
-    /// argument matched against repository roots, then the default repository.
+    /// argument matched against repository roots, then the default repository. Used
+    /// by tools that inherently operate on one repository (commit/lore/branch tools).
     fn resolve_repository(&self, args: &Value) -> Arc<Repository> {
-        // 1) Explicit repository name.
-        if let Some(name) = args.get("repository").and_then(|v| v.as_str()) {
-            if let Some(repo) = self.repositories.iter().find(|r| r.name == name) {
-                return repo.clone();
-            }
-            eprintln!("Warning: unknown repository '{name}', using default");
+        if let Some(repo) = self.repository_by_name_arg(args) {
+            return repo;
         }
-
-        // 2) Auto-detect from a path-bearing argument (only meaningful with >1 repo).
         if self.repositories.len() > 1 {
-            for key in ["path", "file", "file_path", "path_pattern"] {
-                if let Some(p) = args.get(key).and_then(|v| v.as_str()) {
-                    if let Some(repo) = self.repository_for_path(p) {
-                        return repo;
-                    }
-                }
+            if let Some(repo) = self.repository_from_path_args(args) {
+                return repo;
             }
-            if let Some(arr) = args.get("path_patterns").and_then(|v| v.as_array()) {
-                for v in arr {
-                    if let Some(repo) = v.as_str().and_then(|p| self.repository_for_path(p)) {
-                        return repo;
+        }
+        self.default_repository().clone()
+    }
+
+    /// Repositories named by an explicit `repositories` list argument.
+    ///
+    /// Unknown names are warned about and skipped; returns `None` when the
+    /// argument is absent or names nothing valid.
+    fn repositories_by_name_list(&self, args: &Value) -> Option<Vec<Arc<Repository>>> {
+        let arr = args.get("repositories").and_then(|v| v.as_array())?;
+        let selected: Vec<Arc<Repository>> = arr
+            .iter()
+            .filter_map(|v| v.as_str())
+            .filter_map(
+                |name| match self.repositories.iter().find(|r| r.name == name) {
+                    Some(repo) => Some(repo.clone()),
+                    None => {
+                        eprintln!("Warning: unknown repository '{name}'");
+                        None
                     }
+                },
+            )
+            .collect();
+        (!selected.is_empty()).then_some(selected)
+    }
+
+    /// Pick the set of repositories a symbol lookup should run against.
+    ///
+    /// Resolution order: an explicit `repositories` list, an explicit `repository`
+    /// name, a path-bearing argument, then the server's default search set (which
+    /// itself defaults to just the default repository). Results from more than one
+    /// repository are merged and labeled by name.
+    fn resolve_repositories(&self, args: &Value) -> Vec<Arc<Repository>> {
+        if let Some(repos) = self.repositories_by_name_list(args) {
+            return repos;
+        }
+        if let Some(repo) = self.repository_by_name_arg(args) {
+            return vec![repo];
+        }
+        if self.repositories.len() > 1 {
+            if let Some(repo) = self.repository_from_path_args(args) {
+                return vec![repo];
+            }
+            return self
+                .default_search
+                .iter()
+                .map(|&i| self.repositories[i].clone())
+                .collect();
+        }
+        vec![self.default_repository().clone()]
+    }
+
+    /// Run a per-repository lookup across the repository set selected for `args`
+    /// and merge the text outputs.
+    ///
+    /// With a single target repository the behavior matches a plain lookup
+    /// (errors and empty-database messages are surfaced directly). When several
+    /// repositories are selected, each repository's output is labeled with its
+    /// name and per-repository errors are reported inline instead of aborting.
+    async fn run_query<F, Fut>(&self, args: &Value, action_desc: &str, f: F) -> Value
+    where
+        F: Fn(Arc<Repository>) -> Fut,
+        Fut: std::future::Future<Output = Result<String>>,
+    {
+        let repos = self.resolve_repositories(args);
+        let multi = repos.len() > 1;
+        let mut sections: Vec<String> = Vec::new();
+
+        for repo in repos {
+            let name = repo.name.clone();
+            if let Some(status_msg) = self.check_database_status(&repo).await {
+                if !multi {
+                    return json!({"content": [{"type": "text", "text": status_msg}]});
+                }
+                sections.push(format!("=== {name} ===\n{status_msg}"));
+                continue;
+            }
+            match f(repo).await {
+                Ok(output) if multi => sections.push(format!("=== {name} ===\n{output}")),
+                Ok(output) => sections.push(output),
+                Err(e) if multi => sections.push(format!("=== {name} ===\nError: {e}")),
+                Err(e) => {
+                    return json!({
+                        "error": format!("Failed to {action_desc}: {e}"),
+                        "isError": true
+                    })
                 }
             }
         }
 
-        // 3) Default.
-        self.default_repository().clone()
+        json!({
+            "content": [{"type": "text", "text": truncate_output(sections.join("\n\n"))}]
+        })
     }
 
     /// Check if the database appears to be empty and return a helpful message if so
@@ -2955,6 +3238,7 @@ impl McpServer {
             "indexing_status" => self.handle_indexing_status().await,
             "list_branches" => self.handle_list_branches(arguments).await,
             "compare_branches" => self.handle_compare_branches(arguments).await,
+            "list_repositories" => self.handle_list_repositories().await,
             // Lazy loading meta-tools
             "list_categories" => self.handle_list_categories().await,
             "get_tools" => self.handle_get_tools(arguments).await,
@@ -3050,6 +3334,7 @@ impl McpServer {
             "indexing_status" => self.handle_indexing_status().await,
             "list_branches" => self.handle_list_branches(tool_args).await,
             "compare_branches" => self.handle_compare_branches(tool_args).await,
+            "list_repositories" => self.handle_list_repositories().await,
             // Meta-tools cannot be called via call_tool
             "list_categories" | "get_tools" | "call_tool" => {
                 json!({
@@ -3121,128 +3406,81 @@ impl McpServer {
     }
 
     async fn handle_find_function(&self, args: &Value) -> Value {
-        let repo = self.resolve_repository(args);
-        // Check if database is empty and return helpful message
-        if let Some(status_msg) = self.check_database_status(&repo).await {
-            return json!({
-                "content": [{"type": "text", "text": status_msg}]
-            });
-        }
+        let name = args["name"].as_str().unwrap_or("").to_string();
+        let git_sha_arg = args["git_sha"].as_str().map(str::to_string);
+        let branch_arg = args["branch"].as_str().map(str::to_string);
 
-        let name = args["name"].as_str().unwrap_or("");
-        let git_sha_arg = args["git_sha"].as_str();
-        let branch_arg = args["branch"].as_str();
-        let git_sha = repo
-            .resolve_git_sha_or_branch(git_sha_arg, branch_arg)
-            .await;
-
-        match mcp_query_function_or_macro(&repo.db, name, &git_sha).await {
-            Ok(output) => json!({
-                "content": [{"type": "text", "text": truncate_output(output)}]
-            }),
-            Err(e) => json!({
-                "error": format!("Failed to find function: {}", e),
-                "isError": true
-            }),
-        }
+        self.run_query(args, "find function", move |repo| {
+            let (name, git_sha_arg, branch_arg) =
+                (name.clone(), git_sha_arg.clone(), branch_arg.clone());
+            async move {
+                let git_sha = repo
+                    .resolve_git_sha_or_branch(git_sha_arg.as_deref(), branch_arg.as_deref())
+                    .await;
+                mcp_query_function_or_macro(&repo.db, &name, &git_sha).await
+            }
+        })
+        .await
     }
 
     async fn handle_find_type(&self, args: &Value) -> Value {
-        let repo = self.resolve_repository(args);
-        // Check if database is empty and return helpful message
-        if let Some(status_msg) = self.check_database_status(&repo).await {
-            return json!({
-                "content": [{"type": "text", "text": status_msg}]
-            });
-        }
+        let name = args["name"].as_str().unwrap_or("").to_string();
+        let git_sha_arg = args["git_sha"].as_str().map(str::to_string);
+        let branch_arg = args["branch"].as_str().map(str::to_string);
 
-        let name = args["name"].as_str().unwrap_or("");
-        let git_sha_arg = args["git_sha"].as_str();
-        let branch_arg = args["branch"].as_str();
-        let git_sha = repo
-            .resolve_git_sha_or_branch(git_sha_arg, branch_arg)
-            .await;
-
-        match mcp_query_type_or_typedef(&repo.db, name, &git_sha).await {
-            Ok(output) => json!({
-                "content": [{"type": "text", "text": truncate_output(output)}]
-            }),
-            Err(e) => json!({
-                "error": format!("Failed to find type: {}", e),
-                "isError": true
-            }),
-        }
+        self.run_query(args, "find type", move |repo| {
+            let (name, git_sha_arg, branch_arg) =
+                (name.clone(), git_sha_arg.clone(), branch_arg.clone());
+            async move {
+                let git_sha = repo
+                    .resolve_git_sha_or_branch(git_sha_arg.as_deref(), branch_arg.as_deref())
+                    .await;
+                mcp_query_type_or_typedef(&repo.db, &name, &git_sha).await
+            }
+        })
+        .await
     }
 
     async fn handle_find_callers(&self, args: &Value) -> Value {
-        let repo = self.resolve_repository(args);
-        // Check if database is empty and return helpful message
-        if let Some(status_msg) = self.check_database_status(&repo).await {
-            return json!({
-                "content": [{"type": "text", "text": status_msg}]
-            });
-        }
+        let name = args["name"].as_str().unwrap_or("").to_string();
+        let git_sha_arg = args["git_sha"].as_str().map(str::to_string);
+        let branch_arg = args["branch"].as_str().map(str::to_string);
 
-        let name = args["name"].as_str().unwrap_or("");
-        let git_sha_arg = args["git_sha"].as_str();
-        let branch_arg = args["branch"].as_str();
-        let git_sha = repo
-            .resolve_git_sha_or_branch(git_sha_arg, branch_arg)
-            .await;
-
-        match mcp_show_callers(&repo.db, name, &git_sha).await {
-            Ok(output) => json!({
-                "content": [{"type": "text", "text": truncate_output(output)}]
-            }),
-            Err(e) => json!({
-                "error": format!("Failed to find callers: {}", e),
-                "isError": true
-            }),
-        }
+        self.run_query(args, "find callers", move |repo| {
+            let (name, git_sha_arg, branch_arg) =
+                (name.clone(), git_sha_arg.clone(), branch_arg.clone());
+            async move {
+                let git_sha = repo
+                    .resolve_git_sha_or_branch(git_sha_arg.as_deref(), branch_arg.as_deref())
+                    .await;
+                mcp_show_callers(&repo.db, &name, &git_sha).await
+            }
+        })
+        .await
     }
 
     async fn handle_find_calls(&self, args: &Value) -> Value {
-        let repo = self.resolve_repository(args);
-        // Check if database is empty and return helpful message
-        if let Some(status_msg) = self.check_database_status(&repo).await {
-            return json!({
-                "content": [{"type": "text", "text": status_msg}]
-            });
-        }
+        let name = args["name"].as_str().unwrap_or("").to_string();
+        let git_sha_arg = args["git_sha"].as_str().map(str::to_string);
+        let branch_arg = args["branch"].as_str().map(str::to_string);
 
-        let name = args["name"].as_str().unwrap_or("");
-        let git_sha_arg = args["git_sha"].as_str();
-        let branch_arg = args["branch"].as_str();
-        let git_sha = repo
-            .resolve_git_sha_or_branch(git_sha_arg, branch_arg)
-            .await;
-
-        match mcp_show_calls(&repo.db, name, &git_sha).await {
-            Ok(output) => json!({
-                "content": [{"type": "text", "text": truncate_output(output)}]
-            }),
-            Err(e) => json!({
-                "error": format!("Failed to find calls: {}", e),
-                "isError": true
-            }),
-        }
+        self.run_query(args, "find calls", move |repo| {
+            let (name, git_sha_arg, branch_arg) =
+                (name.clone(), git_sha_arg.clone(), branch_arg.clone());
+            async move {
+                let git_sha = repo
+                    .resolve_git_sha_or_branch(git_sha_arg.as_deref(), branch_arg.as_deref())
+                    .await;
+                mcp_show_calls(&repo.db, &name, &git_sha).await
+            }
+        })
+        .await
     }
 
     async fn handle_find_callchain(&self, args: &Value) -> Value {
-        let repo = self.resolve_repository(args);
-        // Check if database is empty and return helpful message
-        if let Some(status_msg) = self.check_database_status(&repo).await {
-            return json!({
-                "content": [{"type": "text", "text": status_msg}]
-            });
-        }
-
-        let name = args["name"].as_str().unwrap_or("");
-        let git_sha_arg = args["git_sha"].as_str();
-        let branch_arg = args["branch"].as_str();
-        let git_sha = repo
-            .resolve_git_sha_or_branch(git_sha_arg, branch_arg)
-            .await;
+        let name = args["name"].as_str().unwrap_or("").to_string();
+        let git_sha_arg = args["git_sha"].as_str().map(str::to_string);
+        let branch_arg = args["branch"].as_str().map(str::to_string);
 
         // Parse the new parameters with same defaults as query tool
         let up_levels = args["up_levels"].as_u64().unwrap_or(2) as usize;
@@ -3253,24 +3491,25 @@ impl McpServer {
         let up_levels = if up_levels == 0 { 15 } else { up_levels };
         let down_levels = if down_levels == 0 { 15 } else { down_levels };
 
-        match mcp_show_callchain_with_limits(
-            &repo.db,
-            name,
-            &git_sha,
-            up_levels,
-            down_levels,
-            calls_limit,
-        )
+        self.run_query(args, "find callchain", move |repo| {
+            let (name, git_sha_arg, branch_arg) =
+                (name.clone(), git_sha_arg.clone(), branch_arg.clone());
+            async move {
+                let git_sha = repo
+                    .resolve_git_sha_or_branch(git_sha_arg.as_deref(), branch_arg.as_deref())
+                    .await;
+                mcp_show_callchain_with_limits(
+                    &repo.db,
+                    &name,
+                    &git_sha,
+                    up_levels,
+                    down_levels,
+                    calls_limit,
+                )
+                .await
+            }
+        })
         .await
-        {
-            Ok(output) => json!({
-                "content": [{"type": "text", "text": truncate_output(output)}]
-            }),
-            Err(e) => json!({
-                "error": format!("Failed to find callchain: {}", e),
-                "isError": true
-            }),
-        }
     }
 
     async fn handle_diff_functions(&self, args: &Value) -> Value {
@@ -4025,6 +4264,48 @@ impl McpServer {
 
         json!({
             "content": [{"type": "text", "text": result}]
+        })
+    }
+
+    async fn handle_list_repositories(&self) -> Value {
+        let mut output = String::from("=== Configured Repositories ===\n\n");
+        for (i, repo) in self.repositories.iter().enumerate() {
+            let default_marker = if i == self.default_repo {
+                " (default)"
+            } else {
+                ""
+            };
+            output.push_str(&format!("{}{}\n", repo.name, default_marker));
+            output.push_str(&format!("  Path: {}\n", repo.git_repo_path));
+            if let Some(url) = &repo.source_url {
+                output.push_str(&format!("  Source: {}\n", url));
+            }
+            if let Some(sha) = &repo.default_git_sha {
+                output.push_str(&format!("  HEAD: {}\n", &sha[..12.min(sha.len())]));
+            }
+            output.push('\n');
+        }
+        let default_search: Vec<&str> = self
+            .default_search
+            .iter()
+            .map(|&i| self.repositories[i].name.as_str())
+            .collect();
+        output.push_str(&format!(
+            "Total: {} repositor{}\n",
+            self.repositories.len(),
+            if self.repositories.len() == 1 {
+                "y"
+            } else {
+                "ies"
+            },
+        ));
+        output.push_str(&format!(
+            "Default symbol search: {}\n",
+            default_search.join(", ")
+        ));
+
+        json!({
+            "content": [{"type": "text", "text": output}]
         })
     }
 
@@ -5829,44 +6110,52 @@ async fn main() -> Result<()> {
 
     eprintln!("Starting Semcode MCP Server...");
     eprintln!(
-        "Database: {}",
-        args.database.as_deref().unwrap_or("(auto-detect)")
-    );
-    eprintln!("Git repository: {}", args.git_repo);
-    eprintln!(
         "Lazy loading: {}",
         if args.lazy { "enabled" } else { "disabled" }
     );
     eprintln!("Transport: stdio");
 
-    // Process database path with search order: 1) -d flag, 2) current directory
-    let database_path = process_database_path(args.database.as_deref(), None);
+    // Build the server: from a multi-repository config file when provided,
+    // otherwise a single repository from --database/--git-repo.
+    let server = if let Some(config_path) = args.config.as_deref() {
+        eprintln!("Config: {config_path}");
+        let cfg = ServerConfig::load(config_path)?;
+        Arc::new(McpServer::from_config(cfg, args.model_path, args.lazy).await?)
+    } else {
+        eprintln!(
+            "Database: {}",
+            args.database.as_deref().unwrap_or("(auto-detect)")
+        );
+        eprintln!("Git repository: {}", args.git_repo);
+        // Process database path with search order: 1) -d flag, 2) current directory
+        let database_path = process_database_path(args.database.as_deref(), None);
+        Arc::new(McpServer::new(&database_path, &args.git_repo, args.model_path, args.lazy).await?)
+    };
 
-    // Create MCP server
-    let server =
-        Arc::new(McpServer::new(&database_path, &args.git_repo, args.model_path, args.lazy).await?);
+    // Spawn a background indexing task per repository. They share the server-wide
+    // indexing status (a hint; per-repository emptiness is checked against each DB).
+    eprintln!("[Background] Spawning background indexing task(s)");
+    let mut indexing_handles = Vec::new();
+    for repo in &server.repositories {
+        let db_for_indexing = repo.db.clone();
+        let git_repo_for_indexing = repo.git_repo_path.clone();
+        let indexing_state_for_bg = server.indexing_state.clone();
+        let notification_tx_for_bg = server.notification_tx.clone();
+        indexing_handles.push(tokio::spawn(async move {
+            // Ensure tables exist before indexing
+            if let Err(e) = db_for_indexing.create_tables().await {
+                eprintln!("[Background] Error creating/verifying tables: {}", e);
+            }
 
-    // Spawn background task to index current commit if needed
-    eprintln!("[Background] Spawning background indexing task");
-    let default_repo = server.default_repository();
-    let db_for_indexing = default_repo.db.clone();
-    let git_repo_for_indexing = default_repo.git_repo_path.clone();
-    let indexing_state_for_bg = server.indexing_state.clone();
-    let notification_tx_for_bg = server.notification_tx.clone();
-    let indexing_handle = tokio::spawn(async move {
-        // Ensure tables exist before indexing
-        if let Err(e) = db_for_indexing.create_tables().await {
-            eprintln!("[Background] Error creating/verifying tables: {}", e);
-        }
-
-        index_current_commit_background(
-            db_for_indexing,
-            git_repo_for_indexing,
-            indexing_state_for_bg,
-            notification_tx_for_bg,
-        )
-        .await;
-    });
+            index_current_commit_background(
+                db_for_indexing,
+                git_repo_for_indexing,
+                indexing_state_for_bg,
+                notification_tx_for_bg,
+            )
+            .await;
+        }));
+    }
 
     // Give the background task a chance to start before entering the blocking loop
     tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
@@ -5874,9 +6163,11 @@ async fn main() -> Result<()> {
     // Run MCP server on stdio
     run_stdio_server(server).await?;
 
-    // Gracefully shutdown the background indexing task
-    indexing_handle.abort();
-    let _ = indexing_handle.await;
+    // Gracefully shutdown the background indexing tasks
+    for handle in indexing_handles {
+        handle.abort();
+        let _ = handle.await;
+    }
 
     Ok(())
 }
@@ -5899,10 +6190,12 @@ mod tests {
             git_repo_path: ".".to_string(),
             root_path: std::path::PathBuf::from("."),
             default_git_sha: None,
+            source_url: None,
         });
         McpServer {
             repositories: vec![repo],
             default_repo: 0,
+            default_search: vec![0],
             model_path: None,
             page_cache: PageCache::new(),
             indexing_state: Arc::new(tokio::sync::Mutex::new(indexing_state)),
@@ -6138,9 +6431,131 @@ mod tests {
     }
 
     #[test]
-    fn test_get_all_tool_schemas_returns_16_tools() {
+    fn test_get_all_tool_schemas_returns_all_tools() {
         let schemas = get_all_tool_schemas();
-        assert_eq!(schemas.len(), 17, "Should return all 17 tool schemas");
+        assert_eq!(schemas.len(), 18, "Should return all 18 tool schemas");
+    }
+
+    #[test]
+    fn test_server_config_parses_repositories_and_defaults() {
+        let json = r#"{
+            "default": "systemd",
+            "default_repositories": ["narf", "systemd"],
+            "repositories": [
+                {"name": "narf", "path": "/data/narf"},
+                {"name": "systemd", "path": "/data/systemd", "database": "/tmp/sd.db",
+                 "source_url": "https://github.com/systemd/systemd"}
+            ]
+        }"#;
+        let cfg: ServerConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            cfg.default_repositories.as_deref(),
+            Some(["narf".to_string(), "systemd".to_string()].as_slice())
+        );
+        assert_eq!(cfg.default.as_deref(), Some("systemd"));
+        assert_eq!(cfg.repositories.len(), 2);
+        assert_eq!(cfg.repositories[0].name, "narf");
+        assert!(cfg.repositories[0].database.is_none());
+        assert_eq!(cfg.repositories[1].database.as_deref(), Some("/tmp/sd.db"));
+        assert_eq!(
+            cfg.repositories[1].source_url.as_deref(),
+            Some("https://github.com/systemd/systemd")
+        );
+    }
+
+    #[test]
+    fn test_server_config_defaults_when_omitted() {
+        let cfg: ServerConfig =
+            serde_json::from_str(r#"{"repositories": [{"name": "a", "path": "/a"}]}"#).unwrap();
+        assert!(cfg.default_repositories.is_none());
+        assert!(cfg.default.is_none());
+    }
+
+    // Build a server over N real (temp-dir) repositories for routing tests.
+    async fn routing_server(
+        roots: &[(&str, &std::path::Path)],
+        default_search: Vec<usize>,
+    ) -> McpServer {
+        let mut repositories = Vec::new();
+        for (name, path) in roots {
+            let db = Arc::new(
+                DatabaseManager::new(
+                    path.join("db").to_str().unwrap(),
+                    path.to_string_lossy().into(),
+                )
+                .await
+                .unwrap(),
+            );
+            repositories.push(Arc::new(Repository {
+                name: name.to_string(),
+                db,
+                git_repo_path: path.to_string_lossy().into(),
+                root_path: std::fs::canonicalize(path).unwrap(),
+                default_git_sha: None,
+                source_url: None,
+            }));
+        }
+        McpServer {
+            repositories,
+            default_repo: 0,
+            default_search,
+            model_path: None,
+            page_cache: PageCache::new(),
+            indexing_state: Arc::new(tokio::sync::Mutex::new(IndexingState::new())),
+            notification_tx: Arc::new(tokio::sync::Mutex::new(None)),
+            lazy_mode: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_routing_by_name_path_and_list() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        let c = tempfile::tempdir().unwrap();
+        // Default search set is just repo "a" (index 0).
+        let server = routing_server(
+            &[("a", a.path()), ("b", b.path()), ("c", c.path())],
+            vec![0],
+        )
+        .await;
+
+        // Explicit repository name wins.
+        let sel = server.resolve_repositories(&json!({"repository": "b"}));
+        assert_eq!(sel.len(), 1);
+        assert_eq!(sel[0].name, "b");
+
+        // Explicit repositories list scopes to that subset (and overrides `repository`).
+        let sel =
+            server.resolve_repositories(&json!({"repository": "a", "repositories": ["b", "c"]}));
+        let names: Vec<&str> = sel.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, ["b", "c"]);
+
+        // Unknown names in the list are skipped.
+        let sel = server.resolve_repositories(&json!({"repositories": ["b", "nope"]}));
+        assert_eq!(sel.len(), 1);
+        assert_eq!(sel[0].name, "b");
+
+        // Path argument routes to the containing repository.
+        let file_in_b = b.path().join("src.rs");
+        std::fs::write(&file_in_b, "").unwrap();
+        let sel = server.resolve_repositories(&json!({"path": file_in_b.to_str().unwrap()}));
+        assert_eq!(sel.len(), 1);
+        assert_eq!(sel[0].name, "b");
+
+        // No selection => the server's default search set (repo "a" only).
+        let sel = server.resolve_repositories(&json!({"name": "sym"}));
+        assert_eq!(sel.len(), 1);
+        assert_eq!(sel[0].name, "a");
+    }
+
+    #[tokio::test]
+    async fn test_default_search_set_is_used_when_unscoped() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        // Default search set spans both repositories.
+        let server = routing_server(&[("a", a.path()), ("b", b.path())], vec![0, 1]).await;
+        let sel = server.resolve_repositories(&json!({"name": "sym"}));
+        assert_eq!(sel.len(), 2);
     }
 
     #[test]
@@ -6307,7 +6722,7 @@ mod tests {
         let result = server.handle_list_tools().await;
         let tools = result["tools"].as_array().unwrap();
 
-        // Should return all 17 tools
-        assert_eq!(tools.len(), 17, "Non-lazy mode should return all 17 tools");
+        // Should return all 18 tools
+        assert_eq!(tools.len(), 18, "Non-lazy mode should return all 18 tools");
     }
 }

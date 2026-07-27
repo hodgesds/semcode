@@ -1,0 +1,17 @@
+{
+  "default": "narf",
+  "default_repositories": ["narf", "systemd"],
+  "repositories": [
+    {
+      "name": "narf",
+      "path": "/data/narf",
+      "source_url": "https://github.com/example/narf"
+    },
+    {
+      "name": "systemd",
+      "path": "/data/systemd",
+      "database": "/data/systemd/.semcode.db",
+      "source_url": "https://github.com/systemd/systemd"
+    }
+  ]
+}
