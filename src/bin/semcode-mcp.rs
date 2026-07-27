@@ -1948,6 +1948,7 @@ const TOOL_CATEGORIES: &[ToolCategory] = &[
             "find_callers",
             "find_calls",
             "find_callchain",
+            "find_rust_symbol",
         ],
     },
     ToolCategory {
@@ -1980,6 +1981,20 @@ const TOOL_CATEGORIES: &[ToolCategory] = &[
 /// Get the JSON schema for a specific tool by name
 fn get_tool_schema(name: &str) -> Option<Value> {
     match name {
+        "find_rust_symbol" => Some(json!({
+            "name": "find_rust_symbol",
+            "description": "Find a rust symbol using rust-analyzer's exact type-inference. Only available in rust projects.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "The exact name of the symbol to find"
+                    }
+                },
+                "required": ["query"]
+            }
+        })),
         "find_function" => Some(json!({
             "name": "find_function",
             "description": "Find a function or macro by exact name, optionally at a specific git commit or branch",
@@ -2531,6 +2546,7 @@ fn get_tool_schema(name: &str) -> Option<Value> {
 /// Get all tool schemas as a vector
 fn get_all_tool_schemas() -> Vec<Value> {
     let tool_names = [
+        "find_rust_symbol",
         "find_function",
         "find_type",
         "find_callers",
@@ -2816,6 +2832,7 @@ impl McpServer {
         let arguments = &params["arguments"];
 
         match name {
+            "find_rust_symbol" => self.handle_find_rust_symbol(arguments).await,
             "find_function" => self.handle_find_function(arguments).await,
             "find_type" => self.handle_find_type(arguments).await,
             "find_callers" => self.handle_find_callers(arguments).await,
@@ -2951,6 +2968,51 @@ impl McpServer {
     }
 
     // Tool implementation methods
+    async fn handle_find_rust_symbol(&self, args: &Value) -> Value {
+        let query = args["query"].as_str().unwrap_or("");
+
+        let lsp = match self.db.rust_analyzer() {
+            Some(lsp) => lsp,
+            None => {
+                return json!({
+                    "error": "rust-analyzer is not available. Is this a Rust project with a Cargo.toml?",
+                    "isError": true
+                });
+            }
+        };
+
+        match lsp.workspace_symbol(query).await {
+            Ok(result) => {
+                // An empty result is ambiguous: either the symbol genuinely
+                // doesn't exist, or rust-analyzer is still indexing the project
+                // (workspace/symbol returns nothing until indexing completes).
+                // Surface that hint rather than implying a definitive "no match".
+                let is_empty = match &result {
+                    Value::Array(arr) => arr.is_empty(),
+                    Value::Null => true,
+                    _ => false,
+                };
+                if is_empty {
+                    return json!({
+                        "content": [{"type": "text", "text": format!(
+                            "No symbols matching '{query}' found. If this is a large project, \
+                             rust-analyzer may still be indexing — retry in a few seconds."
+                        )}]
+                    });
+                }
+                let formatted =
+                    serde_json::to_string_pretty(&result).unwrap_or_else(|_| "[]".to_string());
+                json!({
+                    "content": [{"type": "text", "text": truncate_output(formatted)}]
+                })
+            }
+            Err(e) => json!({
+                "error": format!("rust-analyzer error: {}", e),
+                "isError": true
+            }),
+        }
+    }
+
     async fn handle_find_function(&self, args: &Value) -> Value {
         // Check if database is empty and return helpful message
         if let Some(status_msg) = self.check_database_status().await {
@@ -5925,6 +5987,7 @@ mod tests {
     fn test_get_tool_schema_returns_valid_schemas() {
         // Test that all known tools return valid schemas
         let known_tools = [
+            "find_rust_symbol",
             "find_function",
             "find_type",
             "find_callers",
@@ -5969,7 +6032,7 @@ mod tests {
     #[test]
     fn test_get_all_tool_schemas_returns_16_tools() {
         let schemas = get_all_tool_schemas();
-        assert_eq!(schemas.len(), 16, "Should return all 16 tool schemas");
+        assert_eq!(schemas.len(), 17, "Should return all 17 tool schemas");
     }
 
     #[test]
@@ -6199,7 +6262,7 @@ mod tests {
         let result = server.handle_list_tools().await;
         let tools = result["tools"].as_array().unwrap();
 
-        // Should return all 16 tools
-        assert_eq!(tools.len(), 16, "Non-lazy mode should return all 16 tools");
+        // Should return all 17 tools
+        assert_eq!(tools.len(), 17, "Non-lazy mode should return all 17 tools");
     }
 }
