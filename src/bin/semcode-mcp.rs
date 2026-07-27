@@ -2570,24 +2570,25 @@ fn get_all_tool_schemas() -> Vec<Value> {
         .collect()
 }
 
-struct McpServer {
+/// A single indexed repository: its database, git working tree, and metadata.
+///
+/// The MCP server can serve several of these at once (see [`McpServer`]), routing
+/// each tool call to the appropriate repository by explicit name or by matching a
+/// path argument against the repository roots.
+struct Repository {
+    /// Stable identifier used to select this repository in tool calls.
+    name: String,
     db: Arc<DatabaseManager>,
-    default_git_sha: Option<String>,
-    model_path: Option<String>,
+    /// Path to the git working tree used for git-aware resolution.
     git_repo_path: String,
-    page_cache: PageCache,
-    indexing_state: Arc<tokio::sync::Mutex<IndexingState>>,
-    notification_tx: Arc<tokio::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<String>>>>,
-    lazy_mode: bool,
+    /// Canonicalized `git_repo_path`, used for path-based routing.
+    root_path: std::path::PathBuf,
+    /// HEAD SHA resolved at startup (None when not a git repository).
+    default_git_sha: Option<String>,
 }
 
-impl McpServer {
-    async fn new(
-        database_path: &str,
-        git_repo_path: &str,
-        model_path: Option<String>,
-        lazy_mode: bool,
-    ) -> Result<Self> {
+impl Repository {
+    async fn new(name: String, database_path: &str, git_repo_path: &str) -> Result<Arc<Self>> {
         let db_manager = DatabaseManager::new(database_path, git_repo_path.to_string()).await?;
         let db = Arc::new(db_manager);
 
@@ -2602,30 +2603,30 @@ impl McpServer {
         let default_git_sha = match git::get_git_sha(git_repo_path) {
             Ok(sha) => {
                 if let Some(ref sha_val) = sha {
-                    eprintln!("Default git SHA: {sha_val}");
+                    eprintln!("[{name}] Default git SHA: {sha_val}");
                 } else {
                     eprintln!(
-                        "Not in a git repository - git-aware commands will require explicit SHA"
+                        "[{name}] Not in a git repository - git-aware commands will require explicit SHA"
                     );
                 }
                 sha
             }
             Err(e) => {
-                eprintln!("Warning: Failed to get current git SHA: {e} - git-aware commands will require explicit SHA");
+                eprintln!("[{name}] Warning: Failed to get current git SHA: {e} - git-aware commands will require explicit SHA");
                 None
             }
         };
 
-        Ok(Self {
+        let root_path = std::fs::canonicalize(git_repo_path)
+            .unwrap_or_else(|_| std::path::PathBuf::from(git_repo_path));
+
+        Ok(Arc::new(Self {
+            name,
             db,
-            default_git_sha,
-            model_path,
             git_repo_path: git_repo_path.to_string(),
-            page_cache: PageCache::new(),
-            indexing_state: Arc::new(tokio::sync::Mutex::new(IndexingState::new())),
-            notification_tx: Arc::new(tokio::sync::Mutex::new(None)),
-            lazy_mode,
-        })
+            root_path,
+            default_git_sha,
+        }))
     }
 
     /// Resolve git SHA from argument or use default
@@ -2687,9 +2688,114 @@ impl McpServer {
             }
         }
     }
+}
+
+struct McpServer {
+    /// All repositories served by this process. Never empty.
+    repositories: Vec<Arc<Repository>>,
+    /// Index into `repositories` used when a tool call doesn't select one.
+    default_repo: usize,
+    model_path: Option<String>,
+    page_cache: PageCache,
+    indexing_state: Arc<tokio::sync::Mutex<IndexingState>>,
+    notification_tx: Arc<tokio::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<String>>>>,
+    lazy_mode: bool,
+}
+
+impl McpServer {
+    async fn new(
+        database_path: &str,
+        git_repo_path: &str,
+        model_path: Option<String>,
+        lazy_mode: bool,
+    ) -> Result<Self> {
+        let repo = Repository::new("default".to_string(), database_path, git_repo_path).await?;
+        Ok(Self::with_repositories(
+            vec![repo],
+            0,
+            model_path,
+            lazy_mode,
+        ))
+    }
+
+    /// Build a server over a pre-constructed set of repositories.
+    fn with_repositories(
+        repositories: Vec<Arc<Repository>>,
+        default_repo: usize,
+        model_path: Option<String>,
+        lazy_mode: bool,
+    ) -> Self {
+        Self {
+            repositories,
+            default_repo,
+            model_path,
+            page_cache: PageCache::new(),
+            indexing_state: Arc::new(tokio::sync::Mutex::new(IndexingState::new())),
+            notification_tx: Arc::new(tokio::sync::Mutex::new(None)),
+            lazy_mode,
+        }
+    }
+
+    /// The repository used when a tool call doesn't select one explicitly.
+    fn default_repository(&self) -> &Arc<Repository> {
+        &self.repositories[self.default_repo]
+    }
+
+    /// Find the repository whose working tree contains `path`.
+    ///
+    /// When repositories are nested (e.g. git submodules), the longest matching
+    /// root wins so the innermost repository is selected.
+    fn repository_for_path(&self, path: &str) -> Option<Arc<Repository>> {
+        let p = std::path::Path::new(path);
+        let abs = if p.is_absolute() {
+            std::path::PathBuf::from(path)
+        } else {
+            std::fs::canonicalize(path).ok()?
+        };
+        self.repositories
+            .iter()
+            .filter(|r| abs.starts_with(&r.root_path))
+            .max_by_key(|r| r.root_path.as_os_str().len())
+            .cloned()
+    }
+
+    /// Pick the repository for a tool call.
+    ///
+    /// Resolution order: an explicit `repository` name argument, then a path-bearing
+    /// argument matched against repository roots, then the default repository.
+    fn resolve_repository(&self, args: &Value) -> Arc<Repository> {
+        // 1) Explicit repository name.
+        if let Some(name) = args.get("repository").and_then(|v| v.as_str()) {
+            if let Some(repo) = self.repositories.iter().find(|r| r.name == name) {
+                return repo.clone();
+            }
+            eprintln!("Warning: unknown repository '{name}', using default");
+        }
+
+        // 2) Auto-detect from a path-bearing argument (only meaningful with >1 repo).
+        if self.repositories.len() > 1 {
+            for key in ["path", "file", "file_path", "path_pattern"] {
+                if let Some(p) = args.get(key).and_then(|v| v.as_str()) {
+                    if let Some(repo) = self.repository_for_path(p) {
+                        return repo;
+                    }
+                }
+            }
+            if let Some(arr) = args.get("path_patterns").and_then(|v| v.as_array()) {
+                for v in arr {
+                    if let Some(repo) = v.as_str().and_then(|p| self.repository_for_path(p)) {
+                        return repo;
+                    }
+                }
+            }
+        }
+
+        // 3) Default.
+        self.default_repository().clone()
+    }
 
     /// Check if the database appears to be empty and return a helpful message if so
-    async fn check_database_status(&self) -> Option<String> {
+    async fn check_database_status(&self, repo: &Repository) -> Option<String> {
         let state = self.indexing_state.lock().await;
 
         // Check if indexing is currently in progress
@@ -2711,7 +2817,7 @@ impl McpServer {
         }
 
         // Check if we have any functions in the database at all
-        match self.db.count_functions().await {
+        match repo.db.count_functions().await {
             Ok(0) => {
                 // Completely empty database
                 match &state.status {
@@ -2847,7 +2953,7 @@ impl McpServer {
             "dig" => self.handle_dig(arguments).await,
             "vlore_similar_emails" => self.handle_vlore_similar_emails(arguments).await,
             "indexing_status" => self.handle_indexing_status().await,
-            "list_branches" => self.handle_list_branches().await,
+            "list_branches" => self.handle_list_branches(arguments).await,
             "compare_branches" => self.handle_compare_branches(arguments).await,
             // Lazy loading meta-tools
             "list_categories" => self.handle_list_categories().await,
@@ -2942,7 +3048,7 @@ impl McpServer {
             "dig" => self.handle_dig(tool_args).await,
             "vlore_similar_emails" => self.handle_vlore_similar_emails(tool_args).await,
             "indexing_status" => self.handle_indexing_status().await,
-            "list_branches" => self.handle_list_branches().await,
+            "list_branches" => self.handle_list_branches(tool_args).await,
             "compare_branches" => self.handle_compare_branches(tool_args).await,
             // Meta-tools cannot be called via call_tool
             "list_categories" | "get_tools" | "call_tool" => {
@@ -2970,8 +3076,9 @@ impl McpServer {
     // Tool implementation methods
     async fn handle_find_rust_symbol(&self, args: &Value) -> Value {
         let query = args["query"].as_str().unwrap_or("");
+        let repo = self.resolve_repository(args);
 
-        let lsp = match self.db.rust_analyzer() {
+        let lsp = match repo.db.rust_analyzer() {
             Some(lsp) => lsp,
             None => {
                 return json!({
@@ -3014,8 +3121,9 @@ impl McpServer {
     }
 
     async fn handle_find_function(&self, args: &Value) -> Value {
+        let repo = self.resolve_repository(args);
         // Check if database is empty and return helpful message
-        if let Some(status_msg) = self.check_database_status().await {
+        if let Some(status_msg) = self.check_database_status(&repo).await {
             return json!({
                 "content": [{"type": "text", "text": status_msg}]
             });
@@ -3024,11 +3132,11 @@ impl McpServer {
         let name = args["name"].as_str().unwrap_or("");
         let git_sha_arg = args["git_sha"].as_str();
         let branch_arg = args["branch"].as_str();
-        let git_sha = self
+        let git_sha = repo
             .resolve_git_sha_or_branch(git_sha_arg, branch_arg)
             .await;
 
-        match mcp_query_function_or_macro(&self.db, name, &git_sha).await {
+        match mcp_query_function_or_macro(&repo.db, name, &git_sha).await {
             Ok(output) => json!({
                 "content": [{"type": "text", "text": truncate_output(output)}]
             }),
@@ -3040,8 +3148,9 @@ impl McpServer {
     }
 
     async fn handle_find_type(&self, args: &Value) -> Value {
+        let repo = self.resolve_repository(args);
         // Check if database is empty and return helpful message
-        if let Some(status_msg) = self.check_database_status().await {
+        if let Some(status_msg) = self.check_database_status(&repo).await {
             return json!({
                 "content": [{"type": "text", "text": status_msg}]
             });
@@ -3050,11 +3159,11 @@ impl McpServer {
         let name = args["name"].as_str().unwrap_or("");
         let git_sha_arg = args["git_sha"].as_str();
         let branch_arg = args["branch"].as_str();
-        let git_sha = self
+        let git_sha = repo
             .resolve_git_sha_or_branch(git_sha_arg, branch_arg)
             .await;
 
-        match mcp_query_type_or_typedef(&self.db, name, &git_sha).await {
+        match mcp_query_type_or_typedef(&repo.db, name, &git_sha).await {
             Ok(output) => json!({
                 "content": [{"type": "text", "text": truncate_output(output)}]
             }),
@@ -3066,8 +3175,9 @@ impl McpServer {
     }
 
     async fn handle_find_callers(&self, args: &Value) -> Value {
+        let repo = self.resolve_repository(args);
         // Check if database is empty and return helpful message
-        if let Some(status_msg) = self.check_database_status().await {
+        if let Some(status_msg) = self.check_database_status(&repo).await {
             return json!({
                 "content": [{"type": "text", "text": status_msg}]
             });
@@ -3076,11 +3186,11 @@ impl McpServer {
         let name = args["name"].as_str().unwrap_or("");
         let git_sha_arg = args["git_sha"].as_str();
         let branch_arg = args["branch"].as_str();
-        let git_sha = self
+        let git_sha = repo
             .resolve_git_sha_or_branch(git_sha_arg, branch_arg)
             .await;
 
-        match mcp_show_callers(&self.db, name, &git_sha).await {
+        match mcp_show_callers(&repo.db, name, &git_sha).await {
             Ok(output) => json!({
                 "content": [{"type": "text", "text": truncate_output(output)}]
             }),
@@ -3092,8 +3202,9 @@ impl McpServer {
     }
 
     async fn handle_find_calls(&self, args: &Value) -> Value {
+        let repo = self.resolve_repository(args);
         // Check if database is empty and return helpful message
-        if let Some(status_msg) = self.check_database_status().await {
+        if let Some(status_msg) = self.check_database_status(&repo).await {
             return json!({
                 "content": [{"type": "text", "text": status_msg}]
             });
@@ -3102,11 +3213,11 @@ impl McpServer {
         let name = args["name"].as_str().unwrap_or("");
         let git_sha_arg = args["git_sha"].as_str();
         let branch_arg = args["branch"].as_str();
-        let git_sha = self
+        let git_sha = repo
             .resolve_git_sha_or_branch(git_sha_arg, branch_arg)
             .await;
 
-        match mcp_show_calls(&self.db, name, &git_sha).await {
+        match mcp_show_calls(&repo.db, name, &git_sha).await {
             Ok(output) => json!({
                 "content": [{"type": "text", "text": truncate_output(output)}]
             }),
@@ -3118,8 +3229,9 @@ impl McpServer {
     }
 
     async fn handle_find_callchain(&self, args: &Value) -> Value {
+        let repo = self.resolve_repository(args);
         // Check if database is empty and return helpful message
-        if let Some(status_msg) = self.check_database_status().await {
+        if let Some(status_msg) = self.check_database_status(&repo).await {
             return json!({
                 "content": [{"type": "text", "text": status_msg}]
             });
@@ -3128,7 +3240,7 @@ impl McpServer {
         let name = args["name"].as_str().unwrap_or("");
         let git_sha_arg = args["git_sha"].as_str();
         let branch_arg = args["branch"].as_str();
-        let git_sha = self
+        let git_sha = repo
             .resolve_git_sha_or_branch(git_sha_arg, branch_arg)
             .await;
 
@@ -3142,7 +3254,7 @@ impl McpServer {
         let down_levels = if down_levels == 0 { 15 } else { down_levels };
 
         match mcp_show_callchain_with_limits(
-            &self.db,
+            &repo.db,
             name,
             &git_sha,
             up_levels,
@@ -3176,8 +3288,9 @@ impl McpServer {
     }
 
     async fn handle_grep_functions(&self, args: &Value) -> Value {
+        let repo = self.resolve_repository(args);
         // Check if database is empty and return helpful message
-        if let Some(status_msg) = self.check_database_status().await {
+        if let Some(status_msg) = self.check_database_status(&repo).await {
             return json!({
                 "content": [{"type": "text", "text": status_msg}]
             });
@@ -3190,11 +3303,11 @@ impl McpServer {
         let path_pattern = args["path_pattern"].as_str();
         let limit = args["limit"].as_u64().unwrap_or(100) as usize;
 
-        let git_sha = self
+        let git_sha = repo
             .resolve_git_sha_or_branch(git_sha_arg, branch_arg)
             .await;
 
-        match mcp_grep_function_bodies(&self.db, pattern, verbose, path_pattern, limit, &git_sha)
+        match mcp_grep_function_bodies(&repo.db, pattern, verbose, path_pattern, limit, &git_sha)
             .await
         {
             Ok(output) => json!({
@@ -3208,8 +3321,9 @@ impl McpServer {
     }
 
     async fn handle_vgrep_functions(&self, args: &Value) -> Value {
+        let repo = self.resolve_repository(args);
         // Check if database is empty and return helpful message
-        if let Some(status_msg) = self.check_database_status().await {
+        if let Some(status_msg) = self.check_database_status(&repo).await {
             return json!({
                 "content": [{"type": "text", "text": status_msg}]
             });
@@ -3221,12 +3335,12 @@ impl McpServer {
         let path_pattern = args["path_pattern"].as_str();
         let limit = args["limit"].as_u64().unwrap_or(10) as usize;
 
-        let _git_sha = self
+        let _git_sha = repo
             .resolve_git_sha_or_branch(git_sha_arg, branch_arg)
             .await;
 
         match mcp_vgrep_similar_functions(
-            &self.db,
+            &repo.db,
             query_text,
             limit,
             path_pattern,
@@ -3245,6 +3359,7 @@ impl McpServer {
     }
 
     async fn handle_find_commit(&self, args: &Value) -> Value {
+        let repo = self.resolve_repository(args);
         let git_ref = args["git_ref"].as_str();
         let git_range = args["git_range"].as_str();
 
@@ -3316,9 +3431,8 @@ impl McpServer {
             verbose
         );
 
-        // Note: We need git_repo_path for reachability checks
-        // Get it from the database manager or discover from current directory
-        let git_repo_path = "."; // MCP server typically runs in the repo directory
+        // Use the selected repository's working tree for reachability checks.
+        let git_repo_path = repo.git_repo_path.as_str();
 
         // Check if git_range is provided
         if let Some(range) = git_range {
@@ -3333,7 +3447,7 @@ impl McpServer {
                 reachable_sha,
                 git_repo_path,
             };
-            match mcp_show_commit_range(&self.db, range, &params).await {
+            match mcp_show_commit_range(&repo.db, range, &params).await {
                 Ok(output) => {
                     let (result, _paginated) = self.page_cache.get_page(&query_key, &output, page);
                     json!({
@@ -3357,7 +3471,7 @@ impl McpServer {
                 reachable_sha,
                 git_repo_path,
             };
-            match mcp_show_commit_metadata(&self.db, git_ref_str, &params).await {
+            match mcp_show_commit_metadata(&repo.db, git_ref_str, &params).await {
                 Ok(output) => {
                     let (result, _paginated) = self.page_cache.get_page(&query_key, &output, page);
                     json!({
@@ -3381,7 +3495,7 @@ impl McpServer {
                 reachable_sha,
                 git_repo_path,
             };
-            match mcp_show_all_commits(&self.db, &params).await {
+            match mcp_show_all_commits(&repo.db, &params).await {
                 Ok(output) => {
                     let (result, _paginated) = self.page_cache.get_page(&query_key, &output, page);
                     json!({
@@ -3397,6 +3511,7 @@ impl McpServer {
     }
 
     async fn handle_vcommit_similar_commits(&self, args: &Value) -> Value {
+        let repo = self.resolve_repository(args);
         let query_text = args["query_text"].as_str().unwrap_or("");
         let git_range = args["git_range"].as_str();
 
@@ -3468,9 +3583,8 @@ impl McpServer {
             limit
         );
 
-        // Note: We need git_repo_path for git range resolution and reachability checks
-        // Get it from the database manager or discover from current directory
-        let git_repo_path = "."; // MCP server typically runs in the repo directory
+        // Use the selected repository's working tree for range resolution / reachability.
+        let git_repo_path = repo.git_repo_path.as_str();
 
         let params = VCommitParams {
             query_text,
@@ -3485,7 +3599,7 @@ impl McpServer {
             git_repo_path,
             model_path: &self.model_path,
         };
-        match mcp_vcommit_similar_commits(&self.db, &params).await {
+        match mcp_vcommit_similar_commits(&repo.db, &params).await {
             Ok(output) => {
                 let (result, _paginated) = self.page_cache.get_page(&query_key, &output, page);
                 json!({
@@ -3500,6 +3614,7 @@ impl McpServer {
     }
 
     async fn handle_lore_search(&self, args: &Value) -> Value {
+        let repo = self.resolve_repository(args);
         let verbose = args["verbose"].as_bool().unwrap_or(false) as usize; // Convert to usize for function signature
         let show_thread = args["show_thread"].as_bool().unwrap_or(false);
         let show_replies = args["show_replies"].as_bool().unwrap_or(false);
@@ -3604,7 +3719,7 @@ impl McpServer {
         // Handle message_id lookup (same as query tool's -m flag)
         if let Some(msg_id) = message_id {
             match mcp_lore_get_by_message_id(
-                &self.db,
+                &repo.db,
                 msg_id,
                 verbose,
                 show_thread,
@@ -3640,7 +3755,7 @@ impl McpServer {
                 until_date: until_date.as_deref(),
                 mbox_output,
             };
-            match mcp_lore_search_multi_field(&self.db, &search_params).await {
+            match mcp_lore_search_multi_field(&repo.db, &search_params).await {
                 Ok(output) => {
                     let (result, _paginated) = self.page_cache.get_page(&query_key, &output, page);
                     json!({
@@ -3656,6 +3771,7 @@ impl McpServer {
     }
 
     async fn handle_dig(&self, args: &Value) -> Value {
+        let repo = self.resolve_repository(args);
         let commit = args["commit"].as_str().unwrap_or("");
         let verbose = args["verbose"].as_bool().unwrap_or(false) as usize;
         let show_all = args["show_all"].as_bool().unwrap_or(false);
@@ -3707,7 +3823,7 @@ impl McpServer {
             until_date.as_deref().unwrap_or("")
         );
 
-        let git_repo_path = "."; // MCP server typically runs in the repo directory
+        let git_repo_path = repo.git_repo_path.as_str();
 
         let params = DigLoreParams {
             commit_ish: commit,
@@ -3719,7 +3835,7 @@ impl McpServer {
             since_date: since_date.as_deref(),
             until_date: until_date.as_deref(),
         };
-        match mcp_dig_lore_by_commit(&self.db, &params).await {
+        match mcp_dig_lore_by_commit(&repo.db, &params).await {
             Ok(output) => {
                 let (result, _paginated) = self.page_cache.get_page(&query_key, &output, page);
                 json!({
@@ -3734,6 +3850,7 @@ impl McpServer {
     }
 
     async fn handle_vlore_similar_emails(&self, args: &Value) -> Value {
+        let repo = self.resolve_repository(args);
         let query_text = args["query_text"].as_str().unwrap_or("");
 
         // Extract from_patterns array
@@ -3845,7 +3962,7 @@ impl McpServer {
             until_date: until_date.as_deref(),
             model_path: &self.model_path,
         };
-        match mcp_vlore_similar_emails(&self.db, &params).await {
+        match mcp_vlore_similar_emails(&repo.db, &params).await {
             Ok(output) => {
                 let (result, _paginated) = self.page_cache.get_page(&query_key, &output, page);
                 json!({
@@ -3911,8 +4028,9 @@ impl McpServer {
         })
     }
 
-    async fn handle_list_branches(&self) -> Value {
-        match self.db.list_indexed_branches().await {
+    async fn handle_list_branches(&self, args: &Value) -> Value {
+        let repo = self.resolve_repository(args);
+        match repo.db.list_indexed_branches().await {
             Ok(branches) => {
                 let mut output = "=== Indexed Branches ===\n\n".to_string();
 
@@ -3923,7 +4041,7 @@ impl McpServer {
                     for branch in &branches {
                         // Check if branch is up-to-date
                         let status =
-                            match git::resolve_branch(&self.git_repo_path, &branch.branch_name) {
+                            match git::resolve_branch(&repo.git_repo_path, &branch.branch_name) {
                                 Ok(current_tip) => {
                                     if current_tip == branch.tip_commit {
                                         "up-to-date"
@@ -3964,6 +4082,7 @@ impl McpServer {
     }
 
     async fn handle_compare_branches(&self, args: &Value) -> Value {
+        let repo = self.resolve_repository(args);
         let branch1 = args["branch1"].as_str().unwrap_or("");
         let branch2 = args["branch2"].as_str().unwrap_or("");
 
@@ -3975,7 +4094,7 @@ impl McpServer {
         }
 
         // Resolve both branches to SHAs
-        let sha1 = match git::resolve_branch(&self.git_repo_path, branch1) {
+        let sha1 = match git::resolve_branch(&repo.git_repo_path, branch1) {
             Ok(sha) => sha,
             Err(e) => {
                 return json!({
@@ -3984,7 +4103,7 @@ impl McpServer {
                 });
             }
         };
-        let sha2 = match git::resolve_branch(&self.git_repo_path, branch2) {
+        let sha2 = match git::resolve_branch(&repo.git_repo_path, branch2) {
             Ok(sha) => sha,
             Err(e) => {
                 return json!({
@@ -4006,7 +4125,7 @@ impl McpServer {
         ));
 
         // Try to find merge base
-        match git::find_merge_base(&self.git_repo_path, &sha1, &sha2) {
+        match git::find_merge_base(&repo.git_repo_path, &sha1, &sha2) {
             Ok(merge_base) => {
                 output.push_str(&format!(
                     "Merge Base: {}\n",
@@ -4029,7 +4148,7 @@ impl McpServer {
 
         // Check indexing status for both branches
         output.push_str("\nIndexing Status:\n");
-        match self.db.get_indexed_branch_info(branch1).await {
+        match repo.db.get_indexed_branch_info(branch1).await {
             Ok(Some(info)) => {
                 let status = if info.tip_commit == sha1 {
                     "up-to-date"
@@ -4050,7 +4169,7 @@ impl McpServer {
                 output.push_str(&format!("  {}: unknown\n", branch1));
             }
         }
-        match self.db.get_indexed_branch_info(branch2).await {
+        match repo.db.get_indexed_branch_info(branch2).await {
             Ok(Some(info)) => {
                 let status = if info.tip_commit == sha2 {
                     "up-to-date"
@@ -5729,8 +5848,9 @@ async fn main() -> Result<()> {
 
     // Spawn background task to index current commit if needed
     eprintln!("[Background] Spawning background indexing task");
-    let db_for_indexing = server.db.clone();
-    let git_repo_for_indexing = args.git_repo.clone();
+    let default_repo = server.default_repository();
+    let db_for_indexing = default_repo.db.clone();
+    let git_repo_for_indexing = default_repo.git_repo_path.clone();
     let indexing_state_for_bg = server.indexing_state.clone();
     let notification_tx_for_bg = server.notification_tx.clone();
     let indexing_handle = tokio::spawn(async move {
@@ -5766,6 +5886,30 @@ mod tests {
     use super::*;
     use clap::Parser;
     use std::env;
+
+    /// Build a server over a single test repository with an explicit indexing state.
+    fn test_server(
+        db: Arc<DatabaseManager>,
+        indexing_state: IndexingState,
+        lazy_mode: bool,
+    ) -> McpServer {
+        let repo = Arc::new(Repository {
+            name: "default".to_string(),
+            db,
+            git_repo_path: ".".to_string(),
+            root_path: std::path::PathBuf::from("."),
+            default_git_sha: None,
+        });
+        McpServer {
+            repositories: vec![repo],
+            default_repo: 0,
+            model_path: None,
+            page_cache: PageCache::new(),
+            indexing_state: Arc::new(tokio::sync::Mutex::new(indexing_state)),
+            notification_tx: Arc::new(tokio::sync::Mutex::new(None)),
+            lazy_mode,
+        }
+    }
 
     // Combined into a single test so the three cases don't race on the
     // process-wide SEMCODE_GIT_REPO env var when cargo runs tests in parallel.
@@ -5860,16 +6004,7 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        let server = McpServer {
-            db,
-            default_git_sha: None,
-            model_path: None,
-            git_repo_path: ".".to_string(),
-            page_cache: PageCache::new(),
-            indexing_state: Arc::new(tokio::sync::Mutex::new(IndexingState::new())),
-            notification_tx: Arc::new(tokio::sync::Mutex::new(None)),
-            lazy_mode: false,
-        };
+        let server = test_server(db, IndexingState::new(), false);
 
         let result = server.handle_indexing_status().await;
         let content = result["content"][0]["text"].as_str().unwrap();
@@ -5895,16 +6030,7 @@ mod tests {
             completed_at: None,
         };
 
-        let server = McpServer {
-            db,
-            default_git_sha: None,
-            model_path: None,
-            git_repo_path: ".".to_string(),
-            page_cache: PageCache::new(),
-            indexing_state: Arc::new(tokio::sync::Mutex::new(state)),
-            notification_tx: Arc::new(tokio::sync::Mutex::new(None)),
-            lazy_mode: false,
-        };
+        let server = test_server(db, state, false);
 
         let result = server.handle_indexing_status().await;
         let content = result["content"][0]["text"].as_str().unwrap();
@@ -5932,16 +6058,7 @@ mod tests {
             completed_at: Some(completed),
         };
 
-        let server = McpServer {
-            db,
-            default_git_sha: None,
-            model_path: None,
-            git_repo_path: ".".to_string(),
-            page_cache: PageCache::new(),
-            indexing_state: Arc::new(tokio::sync::Mutex::new(state)),
-            notification_tx: Arc::new(tokio::sync::Mutex::new(None)),
-            lazy_mode: false,
-        };
+        let server = test_server(db, state, false);
 
         let result = server.handle_indexing_status().await;
         let content = result["content"][0]["text"].as_str().unwrap();
@@ -5966,16 +6083,7 @@ mod tests {
             completed_at: Some(std::time::SystemTime::now()),
         };
 
-        let server = McpServer {
-            db,
-            default_git_sha: None,
-            model_path: None,
-            git_repo_path: ".".to_string(),
-            page_cache: PageCache::new(),
-            indexing_state: Arc::new(tokio::sync::Mutex::new(state)),
-            notification_tx: Arc::new(tokio::sync::Mutex::new(None)),
-            lazy_mode: false,
-        };
+        let server = test_server(db, state, false);
 
         let result = server.handle_indexing_status().await;
         let content = result["content"][0]["text"].as_str().unwrap();
@@ -6066,16 +6174,7 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        let server = McpServer {
-            db,
-            default_git_sha: None,
-            model_path: None,
-            git_repo_path: ".".to_string(),
-            page_cache: PageCache::new(),
-            indexing_state: Arc::new(tokio::sync::Mutex::new(IndexingState::new())),
-            notification_tx: Arc::new(tokio::sync::Mutex::new(None)),
-            lazy_mode: true,
-        };
+        let server = test_server(db, IndexingState::new(), true);
 
         let result = server.handle_list_categories().await;
         let content = result["content"][0]["text"].as_str().unwrap();
@@ -6096,16 +6195,7 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        let server = McpServer {
-            db,
-            default_git_sha: None,
-            model_path: None,
-            git_repo_path: ".".to_string(),
-            page_cache: PageCache::new(),
-            indexing_state: Arc::new(tokio::sync::Mutex::new(IndexingState::new())),
-            notification_tx: Arc::new(tokio::sync::Mutex::new(None)),
-            lazy_mode: true,
-        };
+        let server = test_server(db, IndexingState::new(), true);
 
         let result = server
             .handle_get_tools(&json!({"category": "code_lookup"}))
@@ -6128,16 +6218,7 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        let server = McpServer {
-            db,
-            default_git_sha: None,
-            model_path: None,
-            git_repo_path: ".".to_string(),
-            page_cache: PageCache::new(),
-            indexing_state: Arc::new(tokio::sync::Mutex::new(IndexingState::new())),
-            notification_tx: Arc::new(tokio::sync::Mutex::new(None)),
-            lazy_mode: true,
-        };
+        let server = test_server(db, IndexingState::new(), true);
 
         let result = server
             .handle_get_tools(&json!({"category": "invalid_category"}))
@@ -6156,16 +6237,7 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        let server = McpServer {
-            db,
-            default_git_sha: None,
-            model_path: None,
-            git_repo_path: ".".to_string(),
-            page_cache: PageCache::new(),
-            indexing_state: Arc::new(tokio::sync::Mutex::new(IndexingState::new())),
-            notification_tx: Arc::new(tokio::sync::Mutex::new(None)),
-            lazy_mode: true,
-        };
+        let server = test_server(db, IndexingState::new(), true);
 
         let result = server
             .handle_call_tool(&json!({"tool_name": "nonexistent_tool"}))
@@ -6184,16 +6256,7 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        let server = McpServer {
-            db,
-            default_git_sha: None,
-            model_path: None,
-            git_repo_path: ".".to_string(),
-            page_cache: PageCache::new(),
-            indexing_state: Arc::new(tokio::sync::Mutex::new(IndexingState::new())),
-            notification_tx: Arc::new(tokio::sync::Mutex::new(None)),
-            lazy_mode: true,
-        };
+        let server = test_server(db, IndexingState::new(), true);
 
         // Try to call meta-tools via call_tool
         for meta_tool in &["list_categories", "get_tools", "call_tool"] {
@@ -6217,16 +6280,7 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        let server = McpServer {
-            db,
-            default_git_sha: None,
-            model_path: None,
-            git_repo_path: ".".to_string(),
-            page_cache: PageCache::new(),
-            indexing_state: Arc::new(tokio::sync::Mutex::new(IndexingState::new())),
-            notification_tx: Arc::new(tokio::sync::Mutex::new(None)),
-            lazy_mode: true, // Enable lazy mode
-        };
+        let server = test_server(db, IndexingState::new(), true); // Enable lazy mode
 
         let result = server.handle_list_tools().await;
         let tools = result["tools"].as_array().unwrap();
@@ -6248,16 +6302,7 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        let server = McpServer {
-            db,
-            default_git_sha: None,
-            model_path: None,
-            git_repo_path: ".".to_string(),
-            page_cache: PageCache::new(),
-            indexing_state: Arc::new(tokio::sync::Mutex::new(IndexingState::new())),
-            notification_tx: Arc::new(tokio::sync::Mutex::new(None)),
-            lazy_mode: false, // Disable lazy mode
-        };
+        let server = test_server(db, IndexingState::new(), false); // Disable lazy mode
 
         let result = server.handle_list_tools().await;
         let tools = result["tools"].as_array().unwrap();
