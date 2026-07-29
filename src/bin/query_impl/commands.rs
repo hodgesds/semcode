@@ -2304,12 +2304,12 @@ pub async fn handle_command(
                 println!(
                     "  {}: {}",
                     branch1.yellow(),
-                    &sha1[..12.min(sha1.len())].bright_black()
+                    sha1[..12.min(sha1.len())].bright_black()
                 );
                 println!(
                     "  {}: {}",
                     branch2.yellow(),
-                    &sha2[..12.min(sha2.len())].bright_black()
+                    sha2[..12.min(sha2.len())].bright_black()
                 );
 
                 // Try to find merge base
@@ -2318,7 +2318,7 @@ pub async fn handle_command(
                         println!("\n{}", "Merge Base:".bold());
                         println!(
                             "  {}",
-                            &merge_base[..12.min(merge_base.len())].bright_black()
+                            merge_base[..12.min(merge_base.len())].bright_black()
                         );
 
                         // Show which branch is ahead
@@ -2354,7 +2354,7 @@ pub async fn handle_command(
                             "  {}: {} (indexed at {})",
                             branch1.yellow(),
                             status,
-                            &info.tip_commit[..8.min(info.tip_commit.len())].bright_black()
+                            info.tip_commit[..8.min(info.tip_commit.len())].bright_black()
                         );
                     }
                     Ok(None) => {
@@ -2375,7 +2375,7 @@ pub async fn handle_command(
                             "  {}: {} (indexed at {})",
                             branch2.yellow(),
                             status,
-                            &info.tip_commit[..8.min(info.tip_commit.len())].bright_black()
+                            info.tip_commit[..8.min(info.tip_commit.len())].bright_black()
                         );
                     }
                     Ok(None) => {
