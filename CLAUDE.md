@@ -342,7 +342,10 @@ Semcode uses **Tree-sitter** for C/C++ code analysis:
 - Error handling via `anyhow::Result`
 - Parallel processing with `rayon` crate
 - Progress reporting with `indicatif`
-- Use gitoxide (gix) for all git access, never command line git
+- In Semcode's implementation, use gitoxide (gix) for programmatic git access;
+  Rust code must not shell out to the `git` command.
+- When working on this repository (for example, inspecting changes, creating
+  commits, or merging branches), use the normal `git` command-line tool.
 
 ### Color Output System
 Semcode uses **anstream** + **owo-colors** for automatic color handling:
