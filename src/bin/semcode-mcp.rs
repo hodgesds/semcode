@@ -1001,7 +1001,7 @@ async fn mcp_show_commit_range(
         }
     }
 
-    // Step 2c: Compile path filters if provided (ALL must match)
+    // Step 2c: Compile path filters if provided (ANY must match - OR logic)
     let mut path_filters = Vec::new();
     if !params.path_patterns.is_empty() {
         for pattern in params.path_patterns {
@@ -1232,7 +1232,7 @@ async fn mcp_show_commit_range(
             } else if !params.path_patterns.is_empty() {
                 writeln!(
                     buffer,
-                    "\nInfo: No commits matched ALL {} path pattern(s): {}",
+                    "\nInfo: No commits matched ANY of {} path pattern(s): {}",
                     params.path_patterns.len(),
                     params.path_patterns.join(", ")
                 )?;
@@ -1341,7 +1341,7 @@ async fn mcp_show_all_commits(
         }
     }
 
-    // Step 2c: Compile path filters if provided (ALL must match)
+    // Step 2c: Compile path filters if provided (ANY must match - OR logic)
     let mut path_filters = Vec::new();
     if !params.path_patterns.is_empty() {
         for pattern in params.path_patterns {
@@ -1581,7 +1581,7 @@ async fn mcp_show_all_commits(
             } else if !params.path_patterns.is_empty() {
                 writeln!(
                     buffer,
-                    "\nInfo: No commits matched ALL {} path pattern(s): {}",
+                    "\nInfo: No commits matched ANY of {} path pattern(s): {}",
                     params.path_patterns.len(),
                     params.path_patterns.join(", ")
                 )?;
@@ -2285,7 +2285,7 @@ fn get_tool_schema(name: &str) -> Option<Value> {
                     "path_patterns": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "Optional array of regex patterns to filter results by file paths - ALL patterns must match at least one file path in the commit. Equivalent to passing -p multiple times."
+                        "description": "Optional array of regex patterns to filter results by file paths - ANY pattern must match at least one file path in the commit (OR logic). Equivalent to passing -p multiple times."
                     },
                     "reachable_sha": {
                         "type": "string",
