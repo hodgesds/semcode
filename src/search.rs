@@ -1526,111 +1526,115 @@ pub async fn query_type_or_typedef_to_writer(
     );
     writeln!(writer, "{search_msg}")?;
 
-    // First try to find a type at the specific git SHA
-    let type_result = db.find_type_git_aware(clean_name, git_sha).await?;
+    // First find all type definitions at the specific git SHA.
+    let type_results = db.find_types_git_aware(clean_name, git_sha).await?;
     // Then try to find a typedef at the specific git SHA
     let typedef_result = db.find_typedef_git_aware(clean_name, git_sha).await?;
 
-    match (type_result, typedef_result) {
-        (Some(type_info), Some(typedef_info)) => {
-            // Found both - display both
+    if !type_results.is_empty() || typedef_result.is_some() {
+        if !type_results.is_empty() && typedef_result.is_some() {
             let note = format!(
                 "\n{} Found both a type and a typedef with this name at git SHA {}!",
                 "Note:".yellow(),
                 git_sha.yellow()
             );
             writeln!(writer, "{note}")?;
-            display_type_to_writer(&type_info, writer)?;
+        }
+
+        if type_results.len() > 1 {
+            writeln!(
+                writer,
+                "\n{} Found {} type definitions:",
+                "Note:".yellow(),
+                type_results.len()
+            )?;
+        }
+        for type_info in &type_results {
+            display_type_to_writer(type_info, writer)?;
+        }
+        if let Some(typedef_info) = typedef_result {
             display_typedef_to_writer(&typedef_info, writer)?;
         }
-        (Some(type_info), None) => {
-            display_type_to_writer(&type_info, writer)?;
-        }
-        (None, Some(typedef_info)) => {
-            display_typedef_to_writer(&typedef_info, writer)?;
-        }
-        (None, None) => {
-            // No exact match found, try regex search
-            let regex_types = db.search_types_regex_git_aware(clean_name, git_sha).await?;
-            let regex_typedefs = db
-                .search_typedefs_regex_git_aware(clean_name, git_sha)
-                .await?;
+    } else {
+        // No exact match found, try regex search
+        let regex_types = db.search_types_regex_git_aware(clean_name, git_sha).await?;
+        let regex_typedefs = db
+            .search_typedefs_regex_git_aware(clean_name, git_sha)
+            .await?;
 
-            match (regex_types.is_empty(), regex_typedefs.is_empty()) {
-                (false, false) => {
-                    // Found both types and typedefs with regex
-                    writeln!(writer, "\n{} No exact match found for '{}' at git SHA {}, but found matches using it as a regex pattern:", "Info:".yellow(), clean_name, git_sha.yellow())?;
+        match (regex_types.is_empty(), regex_typedefs.is_empty()) {
+            (false, false) => {
+                // Found both types and typedefs with regex
+                writeln!(writer, "\n{} No exact match found for '{}' at git SHA {}, but found matches using it as a regex pattern:", "Info:".yellow(), clean_name, git_sha.yellow())?;
 
-                    writeln!(
-                        writer,
-                        "\n{}",
-                        "=== Types (regex matches) ===".bold().green()
-                    )?;
-                    for type_info in &regex_types {
-                        display_type_to_writer(type_info, writer)?;
-                    }
-
-                    writeln!(
-                        writer,
-                        "\n{}",
-                        "=== Typedefs (regex matches) ===".bold().green()
-                    )?;
-                    for typedef_info in &regex_typedefs {
-                        display_typedef_to_writer(typedef_info, writer)?;
-                    }
+                writeln!(
+                    writer,
+                    "\n{}",
+                    "=== Types (regex matches) ===".bold().green()
+                )?;
+                for type_info in &regex_types {
+                    display_type_to_writer(type_info, writer)?;
                 }
-                (false, true) => {
-                    // Found only types with regex
-                    writeln!(writer, "\n{} No exact match found for '{}' at git SHA {}, but found types using it as a regex pattern:", "Info:".yellow(), clean_name, git_sha.yellow())?;
-                    for type_info in &regex_types {
-                        display_type_to_writer(type_info, writer)?;
-                    }
-                }
-                (true, false) => {
-                    // Found only typedefs with regex
-                    writeln!(writer, "\n{} No exact match found for '{}' at git SHA {}, but found typedefs using it as a regex pattern:", "Info:".yellow(), clean_name, git_sha.yellow())?;
-                    for typedef_info in &regex_typedefs {
-                        display_typedef_to_writer(typedef_info, writer)?;
-                    }
-                }
-                (true, true) => {
-                    // No regex matches either, show fuzzy suggestions
-                    let error_msg = format!(
-                        "{} No type or typedef '{}' found at git SHA {}",
-                        "Error:".red(),
-                        clean_name,
-                        git_sha.yellow()
-                    );
-                    writeln!(writer, "{error_msg}")?;
 
-                    // Try git-aware fuzzy search for suggestions
-                    let type_suggestions =
-                        db.search_types_fuzzy_git_aware(clean_name, git_sha).await?;
-                    let typedef_suggestions = db
-                        .search_typedefs_fuzzy_git_aware(clean_name, git_sha)
-                        .await?;
+                writeln!(
+                    writer,
+                    "\n{}",
+                    "=== Typedefs (regex matches) ===".bold().green()
+                )?;
+                for typedef_info in &regex_typedefs {
+                    display_typedef_to_writer(typedef_info, writer)?;
+                }
+            }
+            (false, true) => {
+                // Found only types with regex
+                writeln!(writer, "\n{} No exact match found for '{}' at git SHA {}, but found types using it as a regex pattern:", "Info:".yellow(), clean_name, git_sha.yellow())?;
+                for type_info in &regex_types {
+                    display_type_to_writer(type_info, writer)?;
+                }
+            }
+            (true, false) => {
+                // Found only typedefs with regex
+                writeln!(writer, "\n{} No exact match found for '{}' at git SHA {}, but found typedefs using it as a regex pattern:", "Info:".yellow(), clean_name, git_sha.yellow())?;
+                for typedef_info in &regex_typedefs {
+                    display_typedef_to_writer(typedef_info, writer)?;
+                }
+            }
+            (true, true) => {
+                // No regex matches either, show fuzzy suggestions
+                let error_msg = format!(
+                    "{} No type or typedef '{}' found at git SHA {}",
+                    "Error:".red(),
+                    clean_name,
+                    git_sha.yellow()
+                );
+                writeln!(writer, "{error_msg}")?;
 
-                    if !type_suggestions.is_empty() || !typedef_suggestions.is_empty() {
-                        writeln!(writer, "\nDid you mean:")?;
-                        for typ in type_suggestions.iter().take(3) {
-                            writeln!(
-                                writer,
-                                "  - {} {} {} (at git SHA {})",
-                                "type --git".yellow(),
-                                typ.kind,
-                                typ.name,
-                                git_sha.yellow()
-                            )?;
-                        }
-                        for typedef in typedef_suggestions.iter().take(3) {
-                            writeln!(
-                                writer,
-                                "  - {} {} (at git SHA {})",
-                                "typedef --git".yellow(),
-                                typedef.name,
-                                git_sha.yellow()
-                            )?;
-                        }
+                // Try git-aware fuzzy search for suggestions
+                let type_suggestions = db.search_types_fuzzy_git_aware(clean_name, git_sha).await?;
+                let typedef_suggestions = db
+                    .search_typedefs_fuzzy_git_aware(clean_name, git_sha)
+                    .await?;
+
+                if !type_suggestions.is_empty() || !typedef_suggestions.is_empty() {
+                    writeln!(writer, "\nDid you mean:")?;
+                    for typ in type_suggestions.iter().take(3) {
+                        writeln!(
+                            writer,
+                            "  - {} {} {} (at git SHA {})",
+                            "type --git".yellow(),
+                            typ.kind,
+                            typ.name,
+                            git_sha.yellow()
+                        )?;
+                    }
+                    for typedef in typedef_suggestions.iter().take(3) {
+                        writeln!(
+                            writer,
+                            "  - {} {} (at git SHA {})",
+                            "typedef --git".yellow(),
+                            typedef.name,
+                            git_sha.yellow()
+                        )?;
                     }
                 }
             }

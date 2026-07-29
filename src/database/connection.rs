@@ -705,10 +705,13 @@ impl DatabaseManager {
             .unwrap_or_default()
     }
 
-    /// Look up a type in the workdir overlay (if set).
-    fn workdir_find_type(&self, name: &str) -> Option<TypeInfo> {
+    /// Look up all types matching a name in the workdir overlay.
+    fn workdir_find_all_types(&self, name: &str) -> Vec<TypeInfo> {
         let guard = self.workdir_index.read().unwrap();
-        guard.as_ref().and_then(|w| w.find_type(name).cloned())
+        guard
+            .as_ref()
+            .map(|w| w.find_all_types(name).into_iter().cloned().collect())
+            .unwrap_or_default()
     }
 
     /// Find callers in the workdir overlay.
@@ -1351,17 +1354,31 @@ impl DatabaseManager {
     }
 
     pub async fn find_type_git_aware(&self, name: &str, git_sha: &str) -> Result<Option<TypeInfo>> {
-        // Check workdir overlay first
-        if let Some(ty) = self.workdir_find_type(name) {
-            return Ok(Some(ty));
-        }
+        Ok(self
+            .find_types_git_aware(name, git_sha)
+            .await?
+            .into_iter()
+            .next())
+    }
+
+    /// Find all type definitions with an exact name at a specific git commit.
+    pub async fn find_types_git_aware(&self, name: &str, git_sha: &str) -> Result<Vec<TypeInfo>> {
+        let workdir_matches = self.workdir_find_all_types(name);
+        let workdir_files: HashSet<String> = workdir_matches
+            .iter()
+            .map(|ty| ty.file_path.clone())
+            .collect();
+
         // Step 1: Get candidate file paths from symbol_filename table (optimized - no need to load full type records)
         let unique_file_paths = self
             .symbol_filename_store
             .get_filenames_for_symbol(name)
             .await?;
+        if unique_file_paths.is_empty() && workdir_matches.is_empty() {
+            return Ok(Vec::new());
+        }
         if unique_file_paths.is_empty() {
-            return Ok(None);
+            return Ok(workdir_matches);
         }
 
         // Step 2: Resolve file paths to git hashes at target commit
@@ -1374,8 +1391,11 @@ impl DatabaseManager {
                 name,
                 git_sha
             );
+            if !workdir_matches.is_empty() {
+                return Ok(workdir_matches);
+            }
             // Fallback: do a regular find to get any available type
-            return self.find_type(name).await;
+            return Ok(self.find_type(name).await?.into_iter().collect());
         }
 
         // Step 3: Direct targeted search using git hashes
@@ -1391,12 +1411,27 @@ impl DatabaseManager {
                 name,
                 git_sha
             );
+            if !workdir_matches.is_empty() {
+                return Ok(workdir_matches);
+            }
             // Fallback: do a regular find to get any available type
-            return self.find_type(name).await;
+            return Ok(self.find_type(name).await?.into_iter().collect());
         }
 
-        // Return the first match (types typically don't have the same prioritization as functions)
-        Ok(types.into_iter().next())
+        // Replace committed definitions from dirty files with their overlay versions,
+        // and omit definitions from files deleted in the worktree.
+        let mut merged = workdir_matches;
+        for ty in types {
+            if !workdir_files.contains(&ty.file_path) && !self.workdir_is_deleted(&ty.file_path) {
+                merged.push(ty);
+            }
+        }
+        merged.sort_by(|a, b| {
+            a.file_path
+                .cmp(&b.file_path)
+                .then(a.line_start.cmp(&b.line_start))
+        });
+        Ok(merged)
     }
 
     pub async fn get_all_types(&self) -> Result<Vec<TypeInfo>> {
@@ -5950,6 +5985,19 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use std::sync::Arc;
 
+    fn git(repo: &std::path::Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .env("GIT_AUTHOR_NAME", "Semcode Test")
+            .env("GIT_AUTHOR_EMAIL", "semcode@example.com")
+            .env("GIT_COMMITTER_NAME", "Semcode Test")
+            .env("GIT_COMMITTER_EMAIL", "semcode@example.com")
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?} failed");
+    }
+
     #[tokio::test]
     async fn new_tables_use_lance_format_2_2() {
         let temp_dir = tempfile::tempdir().unwrap();
@@ -5979,5 +6027,65 @@ mod tests {
         let dataset = table.dataset().unwrap().get().await.unwrap();
 
         assert_eq!(dataset.manifest().data_storage_format.version, "2.2");
+    }
+
+    #[tokio::test]
+    async fn git_aware_type_lookup_returns_all_definitions() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let repo_path = repo_dir.path();
+        git(repo_path, &["init", "-q"]);
+        std::fs::write(repo_path.join("a.h"), "struct duplicate { int a; };\n").unwrap();
+        std::fs::write(repo_path.join("b.h"), "struct duplicate { long b; };\n").unwrap();
+        git(repo_path, &["add", "a.h", "b.h"]);
+        git(repo_path, &["commit", "-q", "-m", "initial"]);
+
+        let git_sha = crate::git::get_git_sha(repo_path).unwrap().unwrap();
+        let a_hash = crate::git::get_git_file_hash_at_commit(repo_path, &git_sha, "a.h")
+            .unwrap()
+            .unwrap();
+        let b_hash = crate::git::get_git_file_hash_at_commit(repo_path, &git_sha, "b.h")
+            .unwrap()
+            .unwrap();
+        let db_path = repo_path.join(".semcode.db");
+        let db = DatabaseManager::new(
+            db_path.to_str().unwrap(),
+            repo_path.to_string_lossy().into_owned(),
+        )
+        .await
+        .unwrap();
+        db.create_tables().await.unwrap();
+        db.insert_types(vec![
+            TypeInfo {
+                name: "duplicate".to_string(),
+                file_path: "a.h".to_string(),
+                git_file_hash: a_hash,
+                line_start: 1,
+                kind: "struct".to_string(),
+                size: None,
+                members: Vec::new(),
+                definition: "struct duplicate { int a; };".to_string(),
+                types: None,
+            },
+            TypeInfo {
+                name: "duplicate".to_string(),
+                file_path: "b.h".to_string(),
+                git_file_hash: b_hash,
+                line_start: 1,
+                kind: "struct".to_string(),
+                size: None,
+                members: Vec::new(),
+                definition: "struct duplicate { long b; };".to_string(),
+                types: None,
+            },
+        ])
+        .await
+        .unwrap();
+
+        let definitions = db
+            .find_types_git_aware("duplicate", &git_sha)
+            .await
+            .unwrap();
+        let paths: Vec<&str> = definitions.iter().map(|ty| ty.file_path.as_str()).collect();
+        assert_eq!(paths, vec!["a.h", "b.h"]);
     }
 }

@@ -223,43 +223,48 @@ async fn mcp_query_type_or_typedef(
     git_sha: &str,
 ) -> Result<String> {
     // Always use git-aware methods
-    // Use exact git-aware lookup methods (which load full definition)
-    let type_result = db.find_type_git_aware(name, git_sha).await?;
+    // Use exact git-aware lookup methods (which load full definitions)
+    let type_results = db.find_types_git_aware(name, git_sha).await?;
     let typedef_result = db.find_typedef_git_aware(name, git_sha).await?;
 
-    match (type_result, typedef_result) {
-                (Some(type_info), None) => {
-                    Ok(format!(
-                        "Type: {} (git SHA: {})\nFile: {}:{}\nKind: {}\n\nDefinition:\n{}",
-                        type_info.name,
-                        git_sha,
-                        type_info.file_path,
-                        type_info.line_start,
-                        type_info.kind,
-                        type_info.definition
-                    ))
-                },
-                (None, Some(typedef)) => {
-                    Ok(format!(
-                        "Typedef: {} (git SHA: {})\nFile: {}:{}\nUnderlying Type: {}\n\nDefinition:\n{}",
-                        typedef.name,
-                        git_sha,
-                        typedef.file_path,
-                        typedef.line_start,
-                        typedef.underlying_type,
-                        typedef.definition
-                    ))
-                },
-                (Some(type_info), Some(typedef)) => {
-                    Ok(format!(
-                        "Found both type and typedef with name '{}' (git SHA: {})\n\nType: {}\nFile: {}:{}\nKind: {}\nDefinition:\n{}\n\nTypedef: {}\nFile: {}:{}\nUnderlying Type: {}\nDefinition:\n{}",
-                        name, git_sha,
-                        type_info.name, type_info.file_path, type_info.line_start, type_info.kind, type_info.definition,
-                        typedef.name, typedef.file_path, typedef.line_start, typedef.underlying_type, typedef.definition
-                    ))
-                },
-                (None, None) => Ok(format!("Type or typedef '{name}' not found at git SHA {git_sha}"))
+    if type_results.is_empty() && typedef_result.is_none() {
+        return Ok(format!(
+            "Type or typedef '{name}' not found at git SHA {git_sha}"
+        ));
     }
+
+    let mut result = String::new();
+    if type_results.len() > 1 {
+        result.push_str(&format!(
+            "Found {} type definitions with name '{}' (git SHA: {})\n\n",
+            type_results.len(),
+            name,
+            git_sha
+        ));
+    }
+    for type_info in type_results {
+        result.push_str(&format!(
+            "Type: {} (git SHA: {})\nFile: {}:{}\nKind: {}\n\nDefinition:\n{}\n\n",
+            type_info.name,
+            git_sha,
+            type_info.file_path,
+            type_info.line_start,
+            type_info.kind,
+            type_info.definition
+        ));
+    }
+    if let Some(typedef) = typedef_result {
+        result.push_str(&format!(
+            "Typedef: {} (git SHA: {})\nFile: {}:{}\nUnderlying Type: {}\n\nDefinition:\n{}",
+            typedef.name,
+            git_sha,
+            typedef.file_path,
+            typedef.line_start,
+            typedef.underlying_type,
+            typedef.definition
+        ));
+    }
+    Ok(result.trim_end().to_string())
 }
 
 async fn mcp_show_callers(
