@@ -50,6 +50,15 @@ function-like macros.
 
 ## Code search
 
+**file_survey**: return compact Tree-sitter syntax facts for one workspace file
+  - path: source path relative to the workspace
+  - reports function/type definitions, calls, type mentions, and parse errors
+  - omits basic scalar types such as `int`, `char`, `u8`, and `u64` from type
+    mentions
+  - definition tuples are `[name, count]`, where count is distinct git-aware
+    callers or referrers across the indexed workspace
+  - returns compact JSON without line numbers or pretty-printing
+  - does not perform symbol resolution
 **grep_functions**: search function/macro bodies for a regex
   - pattern: the regex to search for
   - verbose: if true, show full function bodies

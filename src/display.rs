@@ -20,6 +20,11 @@ fn print_command_help() {
         "type".yellow(),
         "ty".yellow()
     );
+    println!(
+        "  {} ({}) <path> - Show compact syntax facts for a source file",
+        "file_survey".yellow(),
+        "survey".yellow()
+    );
 
     // Call Graph Commands
     println!(

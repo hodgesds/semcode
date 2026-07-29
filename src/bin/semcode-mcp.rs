@@ -1942,7 +1942,7 @@ struct ToolCategory {
     tool_names: &'static [&'static str],
 }
 
-/// Tool categories for lazy loading - groups the 16 tools into logical categories
+/// Tool categories for lazy loading - groups tools into logical categories
 const TOOL_CATEGORIES: &[ToolCategory] = &[
     ToolCategory {
         name: "code_lookup",
@@ -1958,7 +1958,12 @@ const TOOL_CATEGORIES: &[ToolCategory] = &[
     ToolCategory {
         name: "code_search",
         description: "Pattern and semantic search in code - regex search, semantic similarity, diff analysis",
-        tool_names: &["grep_functions", "vgrep_functions", "diff_functions"],
+        tool_names: &[
+            "file_survey",
+            "grep_functions",
+            "vgrep_functions",
+            "diff_functions",
+        ],
     },
     ToolCategory {
         name: "git_history",
@@ -1985,6 +1990,21 @@ const TOOL_CATEGORIES: &[ToolCategory] = &[
 /// Get the JSON schema for a specific tool by name
 fn get_tool_schema(name: &str) -> Option<Value> {
     match name {
+        "file_survey" => Some(json!({
+            "name": "file_survey",
+            "description": "Survey one workspace source file without returning its full contents. Uses Tree-sitter to report all function and type definitions in the file, all aggregated call-expression spellings, non-scalar type mentions, and parse errors; result categories are not size-limited. Basic scalar types such as int, char, u8, and u64 are omitted from type mentions. Function-definition tuples are [name, distinct_caller_count], and type-definition tuples are [name, distinct_referencer_count]. The count is Git-aware and measures distinct indexed definitions whose deduplicated relationships contain the same spelling; it is not a source-occurrence count or symbol resolution. Call and type-mention tuples are [syntax_text, occurrence_count] within the surveyed file. Output is compact JSON without insignificant whitespace.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Source file path relative to the workspace root"
+                    }
+                },
+                "required": ["path"],
+                "additionalProperties": false
+            }
+        })),
         "find_function" => Some(json!({
             "name": "find_function",
             "description": "Find a function or macro by exact name, optionally at a specific git commit or branch",
@@ -2536,6 +2556,7 @@ fn get_tool_schema(name: &str) -> Option<Value> {
 /// Get all tool schemas as a vector
 fn get_all_tool_schemas() -> Vec<Value> {
     let tool_names = [
+        "file_survey",
         "find_function",
         "find_type",
         "find_callers",
@@ -2817,6 +2838,7 @@ impl McpServer {
         let arguments = &params["arguments"];
 
         match name {
+            "file_survey" => self.handle_file_survey(arguments).await,
             "find_function" => self.handle_find_function(arguments).await,
             "find_type" => self.handle_find_type(arguments).await,
             "find_callers" => self.handle_find_callers(arguments).await,
@@ -2912,6 +2934,7 @@ impl McpServer {
         // Dispatch to the underlying tool handler directly
         // (avoids async recursion through handle_tool_call)
         match tool_name {
+            "file_survey" => self.handle_file_survey(tool_args).await,
             "find_function" => self.handle_find_function(tool_args).await,
             "find_type" => self.handle_find_type(tool_args).await,
             "find_callers" => self.handle_find_callers(tool_args).await,
@@ -2952,6 +2975,43 @@ impl McpServer {
     }
 
     // Tool implementation methods
+    async fn handle_file_survey(&self, args: &Value) -> Value {
+        let Some(path) = args["path"].as_str() else {
+            return json!({
+                "error": "path is required",
+                "isError": true
+            });
+        };
+
+        let workspace = std::path::Path::new(&self.git_repo_path);
+        let result = match semcode::git::get_git_sha(workspace) {
+            Ok(Some(git_sha)) => {
+                self.refresh_workdir_index();
+                semcode::file_survey::survey_file_json_with_references(
+                    workspace,
+                    std::path::Path::new(path),
+                    &self.db,
+                    &git_sha,
+                )
+                .await
+            }
+            Ok(None) => {
+                semcode::file_survey::survey_file_json(workspace, std::path::Path::new(path))
+            }
+            Err(e) => Err(e),
+        };
+
+        match result {
+            Ok(output) => json!({
+                "content": [{"type": "text", "text": output}]
+            }),
+            Err(e) => json!({
+                "error": format!("Failed to survey file: {e}"),
+                "isError": true
+            }),
+        }
+    }
+
     async fn handle_find_function(&self, args: &Value) -> Value {
         // Check if database is empty and return helpful message
         if let Some(status_msg) = self.check_database_status().await {
@@ -5912,6 +5972,7 @@ mod tests {
     fn test_get_tool_schema_returns_valid_schemas() {
         // Test that all known tools return valid schemas
         let known_tools = [
+            "file_survey",
             "find_function",
             "find_type",
             "find_callers",
@@ -5954,9 +6015,18 @@ mod tests {
     }
 
     #[test]
-    fn test_get_all_tool_schemas_returns_16_tools() {
+    fn test_file_survey_schema_explains_reference_counts() {
+        let schema = get_tool_schema("file_survey").unwrap();
+        let description = schema["description"].as_str().unwrap();
+        assert!(description.contains("distinct_caller_count"));
+        assert!(description.contains("distinct_referencer_count"));
+        assert!(description.contains("not a source-occurrence count or symbol resolution"));
+    }
+
+    #[test]
+    fn test_get_all_tool_schemas_returns_17_tools() {
         let schemas = get_all_tool_schemas();
-        assert_eq!(schemas.len(), 16, "Should return all 16 tool schemas");
+        assert_eq!(schemas.len(), 17, "Should return all 17 tool schemas");
     }
 
     #[test]
@@ -6134,6 +6204,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_handle_file_survey() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temp_dir.path().join("sample.c"),
+            "int answer(void) { return helper(); }\n",
+        )
+        .unwrap();
+        let db_dir = temp_dir.path().join("db");
+        let db = Arc::new(
+            DatabaseManager::new(
+                db_dir.to_str().unwrap(),
+                temp_dir.path().to_string_lossy().into_owned(),
+            )
+            .await
+            .unwrap(),
+        );
+        let server = McpServer {
+            db,
+            default_git_sha: None,
+            model_path: None,
+            git_repo_path: temp_dir.path().to_string_lossy().into_owned(),
+            page_cache: PageCache::new(),
+            indexing_state: Arc::new(tokio::sync::Mutex::new(IndexingState::new())),
+            notification_tx: Arc::new(tokio::sync::Mutex::new(None)),
+            lazy_mode: false,
+        };
+
+        let result = server
+            .handle_file_survey(&json!({"path": "sample.c"}))
+            .await;
+        let content = result["content"][0]["text"].as_str().unwrap();
+        let survey: Value = serde_json::from_str(content).unwrap();
+        assert_eq!(survey["file"], "sample.c");
+        assert_eq!(survey["functions_defined"][0][0], "answer");
+        assert_eq!(survey["calls"][0], json!(["helper", 1]));
+    }
+
+    #[tokio::test]
     async fn test_lazy_mode_returns_meta_tools_only() {
         let temp_dir = tempfile::tempdir().unwrap();
         let db = Arc::new(
@@ -6186,7 +6294,7 @@ mod tests {
         let result = server.handle_list_tools().await;
         let tools = result["tools"].as_array().unwrap();
 
-        // Should return all 16 tools
-        assert_eq!(tools.len(), 16, "Non-lazy mode should return all 16 tools");
+        // Should return all 17 tools
+        assert_eq!(tools.len(), 17, "Non-lazy mode should return all 17 tools");
     }
 }

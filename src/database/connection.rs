@@ -776,6 +776,11 @@ impl DatabaseManager {
         guard.as_ref().is_some_and(|w| w.is_deleted(file_path))
     }
 
+    fn workdir_is_dirty(&self, file_path: &str) -> bool {
+        let guard = self.workdir_index.read().unwrap();
+        guard.as_ref().is_some_and(|w| w.is_dirty(file_path))
+    }
+
     /// Merge a HEAD manifest with workdir dirty/deleted state.
     fn workdir_merged_manifest(
         &self,
@@ -1772,6 +1777,180 @@ impl DatabaseManager {
 
     // Call relationship operations
     // Call relationship insertion/resolution methods removed - call relationships are now embedded in function JSON columns
+
+    /// Count distinct current-commit entities that call functions or reference types.
+    /// Embedded relationship arrays are deduplicated during indexing, so these are
+    /// referrer counts rather than raw source occurrence counts.
+    pub async fn get_distinct_reference_counts_git_aware(
+        &self,
+        function_names: &[String],
+        type_names: &[String],
+        git_sha: &str,
+    ) -> Result<(
+        std::collections::HashMap<String, usize>,
+        std::collections::HashMap<String, usize>,
+    )> {
+        use std::collections::{HashMap, HashSet};
+
+        let function_targets: HashSet<String> = function_names.iter().cloned().collect();
+        let type_targets: HashSet<String> = type_names.iter().cloned().collect();
+        let mut function_referrers: HashMap<String, HashSet<String>> = HashMap::new();
+        let mut type_referrers: HashMap<String, HashSet<String>> = HashMap::new();
+        let git_manifest = self.generate_git_manifest(git_sha).await?;
+
+        if !git_manifest.is_empty() && (!function_targets.is_empty() || !type_targets.is_empty()) {
+            let functions_table = self.connection.open_table("functions").execute().await?;
+            let relationship_filter = match (function_targets.is_empty(), type_targets.is_empty()) {
+                (false, false) => "calls IS NOT NULL OR types IS NOT NULL",
+                (false, true) => "calls IS NOT NULL",
+                (true, false) => "types IS NOT NULL",
+                (true, true) => unreachable!(),
+            };
+            let batches = functions_table
+                .query()
+                .only_if(relationship_filter)
+                .select(lancedb::query::Select::Columns(vec![
+                    "name".to_string(),
+                    "file_path".to_string(),
+                    "git_file_hash".to_string(),
+                    "line_start".to_string(),
+                    "calls".to_string(),
+                    "types".to_string(),
+                ]))
+                .execute()
+                .await?
+                .try_collect::<Vec<_>>()
+                .await?;
+
+            for batch in batches {
+                let names: &StringArray = super::get_column(&batch, "name")?;
+                let paths: &StringArray = super::get_column(&batch, "file_path")?;
+                let hashes: &StringArray = super::get_column(&batch, "git_file_hash")?;
+                let lines: &arrow::array::Int64Array = super::get_column(&batch, "line_start")?;
+                let calls: &StringArray = super::get_column(&batch, "calls")?;
+                let types: &StringArray = super::get_column(&batch, "types")?;
+
+                for row in 0..batch.num_rows() {
+                    let path = paths.value(row);
+                    if self.workdir_is_dirty(path) || self.workdir_is_deleted(path) {
+                        continue;
+                    }
+                    if git_manifest.get(path).map(String::as_str) != Some(hashes.value(row)) {
+                        continue;
+                    }
+                    let identity = format!(
+                        "function:{}:{}:{}",
+                        path,
+                        lines.value(row),
+                        names.value(row)
+                    );
+                    if !calls.is_null(row) {
+                        if let Ok(values) = serde_json::from_str::<Vec<String>>(calls.value(row)) {
+                            for target in values {
+                                if function_targets.contains(&target) {
+                                    function_referrers
+                                        .entry(target)
+                                        .or_default()
+                                        .insert(identity.clone());
+                                }
+                            }
+                        }
+                    }
+                    if !types.is_null(row) {
+                        if let Ok(values) = serde_json::from_str::<Vec<String>>(types.value(row)) {
+                            for target in values {
+                                if type_targets.contains(&target) {
+                                    type_referrers
+                                        .entry(target)
+                                        .or_default()
+                                        .insert(identity.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if !type_targets.is_empty() {
+                let types_table = self.connection.open_table("types").execute().await?;
+                let batches = types_table
+                    .query()
+                    .only_if("types IS NOT NULL")
+                    .select(lancedb::query::Select::Columns(vec![
+                        "name".to_string(),
+                        "file_path".to_string(),
+                        "git_file_hash".to_string(),
+                        "line".to_string(),
+                        "types".to_string(),
+                    ]))
+                    .execute()
+                    .await?
+                    .try_collect::<Vec<_>>()
+                    .await?;
+
+                for batch in batches {
+                    let names: &StringArray = super::get_column(&batch, "name")?;
+                    let paths: &StringArray = super::get_column(&batch, "file_path")?;
+                    let hashes: &StringArray = super::get_column(&batch, "git_file_hash")?;
+                    let lines: &arrow::array::Int64Array = super::get_column(&batch, "line")?;
+                    let types: &StringArray = super::get_column(&batch, "types")?;
+
+                    for row in 0..batch.num_rows() {
+                        let path = paths.value(row);
+                        if self.workdir_is_dirty(path) || self.workdir_is_deleted(path) {
+                            continue;
+                        }
+                        if git_manifest.get(path).map(String::as_str) != Some(hashes.value(row)) {
+                            continue;
+                        }
+                        if types.is_null(row) {
+                            continue;
+                        }
+                        let identity =
+                            format!("type:{}:{}:{}", path, lines.value(row), names.value(row));
+                        if let Ok(values) = serde_json::from_str::<Vec<String>>(types.value(row)) {
+                            for target in values {
+                                if type_targets.contains(&target) {
+                                    type_referrers
+                                        .entry(target)
+                                        .or_default()
+                                        .insert(identity.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let (workdir_function_counts, workdir_type_counts) = {
+            let guard = self.workdir_index.read().unwrap();
+            guard
+                .as_ref()
+                .map(|index| index.distinct_reference_counts(&function_targets, &type_targets))
+                .unwrap_or_default()
+        };
+        let function_counts = function_targets
+            .into_iter()
+            .map(|name| {
+                let count = function_referrers.get(&name).map_or(0, HashSet::len)
+                    + workdir_function_counts
+                        .get(&name)
+                        .copied()
+                        .unwrap_or_default();
+                (name, count)
+            })
+            .collect();
+        let type_counts = type_targets
+            .into_iter()
+            .map(|name| {
+                let count = type_referrers.get(&name).map_or(0, HashSet::len)
+                    + workdir_type_counts.get(&name).copied().unwrap_or_default();
+                (name, count)
+            })
+            .collect();
+        Ok((function_counts, type_counts))
+    }
 
     pub async fn get_function_callers(&self, function_name: &str) -> Result<Vec<String>> {
         let total_start = std::time::Instant::now();
@@ -6058,7 +6237,7 @@ mod tests {
             TypeInfo {
                 name: "duplicate".to_string(),
                 file_path: "a.h".to_string(),
-                git_file_hash: a_hash,
+                git_file_hash: a_hash.clone(),
                 line_start: 1,
                 kind: "struct".to_string(),
                 size: None,
@@ -6069,13 +6248,52 @@ mod tests {
             TypeInfo {
                 name: "duplicate".to_string(),
                 file_path: "b.h".to_string(),
-                git_file_hash: b_hash,
+                git_file_hash: b_hash.clone(),
                 line_start: 1,
                 kind: "struct".to_string(),
                 size: None,
                 members: Vec::new(),
                 definition: "struct duplicate { long b; };".to_string(),
                 types: None,
+            },
+            TypeInfo {
+                name: "container".to_string(),
+                file_path: "b.h".to_string(),
+                git_file_hash: b_hash.clone(),
+                line_start: 2,
+                kind: "struct".to_string(),
+                size: None,
+                members: Vec::new(),
+                definition: "struct container { struct duplicate *value; };".to_string(),
+                types: Some(vec!["duplicate".to_string()]),
+            },
+        ])
+        .await
+        .unwrap();
+        db.insert_functions(vec![
+            FunctionInfo {
+                name: "caller_one".to_string(),
+                file_path: "a.h".to_string(),
+                git_file_hash: a_hash,
+                line_start: 2,
+                line_end: 2,
+                return_type: "void".to_string(),
+                parameters: Vec::new(),
+                body: "void caller_one(void) { target(); }".to_string(),
+                calls: Some(vec!["target".to_string()]),
+                types: Some(vec!["duplicate".to_string()]),
+            },
+            FunctionInfo {
+                name: "caller_two".to_string(),
+                file_path: "b.h".to_string(),
+                git_file_hash: b_hash,
+                line_start: 3,
+                line_end: 3,
+                return_type: "void".to_string(),
+                parameters: Vec::new(),
+                body: "void caller_two(void) { target(); }".to_string(),
+                calls: Some(vec!["target".to_string()]),
+                types: Some(vec!["duplicate".to_string()]),
             },
         ])
         .await
@@ -6087,5 +6305,16 @@ mod tests {
             .unwrap();
         let paths: Vec<&str> = definitions.iter().map(|ty| ty.file_path.as_str()).collect();
         assert_eq!(paths, vec!["a.h", "b.h"]);
+
+        let (function_counts, type_counts) = db
+            .get_distinct_reference_counts_git_aware(
+                &["target".to_string()],
+                &["duplicate".to_string()],
+                &git_sha,
+            )
+            .await
+            .unwrap();
+        assert_eq!(function_counts["target"], 2);
+        assert_eq!(type_counts["duplicate"], 3);
     }
 }

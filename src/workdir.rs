@@ -456,6 +456,43 @@ impl WorkdirIndex {
         results
     }
 
+    /// Count distinct dirty-worktree entities that call or reference target names.
+    pub fn distinct_reference_counts(
+        &self,
+        function_names: &HashSet<String>,
+        type_names: &HashSet<String>,
+    ) -> (HashMap<String, usize>, HashMap<String, usize>) {
+        let mut function_counts = HashMap::new();
+        let mut type_counts = HashMap::new();
+
+        for function in self
+            .functions
+            .values()
+            .chain(self.macros.values())
+            .flatten()
+        {
+            if let Some(calls) = &function.calls {
+                for target in calls.iter().filter(|name| function_names.contains(*name)) {
+                    *function_counts.entry(target.clone()).or_default() += 1;
+                }
+            }
+            if let Some(types) = &function.types {
+                for target in types.iter().filter(|name| type_names.contains(*name)) {
+                    *type_counts.entry(target.clone()).or_default() += 1;
+                }
+            }
+        }
+        for ty in self.types.values().flatten() {
+            if let Some(types) = &ty.types {
+                for target in types.iter().filter(|name| type_names.contains(*name)) {
+                    *type_counts.entry(target.clone()).or_default() += 1;
+                }
+            }
+        }
+
+        (function_counts, type_counts)
+    }
+
     /// Grep function bodies with a regex pattern, optionally filtering by file path.
     pub fn grep_functions(&self, pattern: &str, path_pattern: Option<&str>) -> Vec<&FunctionInfo> {
         let body_re = match Regex::new(&format!("(?i){}", pattern)) {

@@ -9,6 +9,7 @@ use semcode::{git, DatabaseManager, LoreEmailFilters};
 use owo_colors::OwoColorize as _;
 use semcode::callchain::{find_all_paths, show_callees, show_callers};
 use semcode::display::print_help;
+use semcode::file_survey::survey_file_json_with_references;
 use semcode::lore_writers::{
     decode_email_body, dig_lore_by_commit_to_writer, lore_get_by_message_id_to_writer,
     lore_search_multi_field_to_writer, lore_search_with_thread_to_writer,
@@ -578,6 +579,22 @@ pub async fn handle_command(
             } else {
                 let name = parts[1..].join(" ");
                 query_type_or_typedef(db, &name, &git_sha).await?;
+            }
+        }
+        "file_survey" | "survey" => {
+            if parts.len() < 2 {
+                println!("{}", "Usage: file_survey <path>".red());
+                println!("  Show compact syntactic structure for one source file");
+            } else {
+                let path = parts[1..].join(" ");
+                let output = survey_file_json_with_references(
+                    std::path::Path::new(git_repo_path),
+                    std::path::Path::new(&path),
+                    db,
+                    &git_sha,
+                )
+                .await?;
+                println!("{output}");
             }
         }
         "grep" => {
