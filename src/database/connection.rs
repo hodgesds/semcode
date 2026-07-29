@@ -6,6 +6,8 @@ use arrow::record_batch::RecordBatch;
 use colored::*;
 use futures::TryStreamExt;
 use lancedb::connection::Connection;
+use lancedb::connection::LanceFileVersion;
+use lancedb::database::listing::ListingDatabaseOptions;
 use lancedb::index::scalar::FullTextSearchQuery;
 use lancedb::query::ExecutableQuery;
 use lancedb::query::QueryBase;
@@ -46,7 +48,13 @@ pub struct DatabaseManager {
 
 impl DatabaseManager {
     pub async fn new(db_path: &str, git_repo_path: String) -> Result<Self> {
-        let connection = lancedb::connect(db_path).execute().await?;
+        let database_options = ListingDatabaseOptions::builder()
+            .data_storage_version(LanceFileVersion::V2_2)
+            .build();
+        let connection = lancedb::connect(db_path)
+            .database_options(&database_options)
+            .execute()
+            .await?;
 
         Ok(Self {
             connection: connection.clone(),
@@ -5932,5 +5940,44 @@ impl DatabaseManager {
         merge_insert.execute(Box::new(batch_iterator)).await?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::{ArrayRef, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn new_tables_use_lance_format_2_2() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db = DatabaseManager::new(
+            temp_dir.path().to_str().unwrap(),
+            temp_dir.path().to_string_lossy().into_owned(),
+        )
+        .await
+        .unwrap();
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Utf8,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StringArray::from(vec!["test"])) as ArrayRef],
+        )
+        .unwrap();
+        let table = db
+            .connection
+            .create_table("storage_version_test", vec![batch])
+            .execute()
+            .await
+            .unwrap();
+        let dataset = table.dataset().unwrap().get().await.unwrap();
+
+        assert_eq!(dataset.manifest().data_storage_format.version, "2.2");
     }
 }
