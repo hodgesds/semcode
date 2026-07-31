@@ -322,16 +322,15 @@ fn extract_c(node: Node<'_>, source: &[u8], out: &mut SurveyBuilder) {
                 }
             }
         }
-        "type_identifier" => {
+        "type_identifier"
             if !has_ancestor(node, "type_definition")
                 && !matches!(
                     node.parent().map(|p| p.kind()),
                     Some("struct_specifier" | "union_specifier" | "enum_specifier")
-                )
-            {
-                if let Some(value) = text(node, source) {
-                    increment(&mut out.types_mentioned, value);
-                }
+                ) =>
+        {
+            if let Some(value) = text(node, source) {
+                increment(&mut out.types_mentioned, value);
             }
         }
         "primitive_type" | "sized_type_specifier" => {
