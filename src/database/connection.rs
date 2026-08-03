@@ -14,6 +14,7 @@ use lancedb::query::QueryBase;
 use std::sync::Arc;
 
 use crate::database::branches::IndexedBranchStore;
+use crate::database::edges::CallEdgeStore;
 use crate::database::functions::FunctionStore;
 use crate::database::schema::SchemaManager;
 use crate::database::search::{SearchManager, VectorSearchManager};
@@ -43,6 +44,7 @@ pub struct DatabaseManager {
     processed_file_store: ProcessedFileStore,
     content_store: ContentStore,
     symbol_filename_store: SymbolFilenameStore,
+    call_edge_store: CallEdgeStore,
     branch_store: IndexedBranchStore,
     workdir_index: std::sync::RwLock<Option<WorkdirIndex>>,
     /// Tree manifests keyed by commit SHA.
@@ -53,6 +55,15 @@ pub struct DatabaseManager {
     /// when the workdir overlay changes, since that is merged into the result.
     manifest_cache: std::sync::RwLock<
         std::collections::HashMap<String, Arc<std::collections::HashMap<String, String>>>,
+    >,
+    /// The blob hashes of a commit's manifest, as a set.
+    ///
+    /// `call_edges` records only the caller's blob hashes, not its path, so the
+    /// git filter is a membership test rather than a path lookup.  Built once
+    /// per SHA -- rebuilding an 85k-entry set inside a call-chain walk would
+    /// cost more than the query.
+    manifest_hash_cache: std::sync::RwLock<
+        std::collections::HashMap<String, Arc<std::collections::HashSet<String>>>,
     >,
 }
 
@@ -78,9 +89,11 @@ impl DatabaseManager {
             processed_file_store: ProcessedFileStore::new(connection.clone()),
             content_store: ContentStore::new(connection.clone()),
             symbol_filename_store: SymbolFilenameStore::new(connection.clone()),
+            call_edge_store: CallEdgeStore::new(connection.clone()),
             branch_store: IndexedBranchStore::new(connection.clone()),
             workdir_index: std::sync::RwLock::new(None),
             manifest_cache: std::sync::RwLock::new(std::collections::HashMap::new()),
+            manifest_hash_cache: std::sync::RwLock::new(std::collections::HashMap::new()),
         })
     }
 
@@ -101,6 +114,7 @@ impl DatabaseManager {
         *self.workdir_index.write().unwrap() = Some(workdir);
         // Cached manifests have the old overlay merged in.
         self.manifest_cache.write().unwrap().clear();
+        self.manifest_hash_cache.write().unwrap().clear();
     }
 
     /// Check if a workdir index is set.
@@ -523,7 +537,14 @@ impl DatabaseManager {
 
     /// Make the scalar indices cover the rows that were just written.
     /// Must run after indexing, or queries fall back to full scans.
+    ///
+    /// Sorts `call_edges` first: the index over it is only useful if the rows
+    /// it points at are contiguous, and sorting rewrites the table, which
+    /// would discard an index built beforehand.
     pub async fn optimize_scalar_indices(&self) -> Result<()> {
+        if let Err(e) = self.call_edge_store.sort_by_callee().await {
+            tracing::warn!("Failed to sort call_edges: {}", e);
+        }
         self.schema_manager.optimize_scalar_indices().await
     }
 
@@ -695,6 +716,12 @@ impl DatabaseManager {
             .iter()
             .map(|f| (f.name.clone(), f.file_path.clone()))
             .collect();
+
+        // Reverse call edges, derived from the same batch.  Done before the
+        // move into insert_batch, which consumes `functions`.
+        self.call_edge_store
+            .insert_from_functions(&functions)
+            .await?;
 
         // Insert functions
         self.function_store.insert_batch(functions).await?;
@@ -1718,6 +1745,10 @@ impl DatabaseManager {
 
     // Metadata-only insertion methods (skip content storage for performance)
     async fn insert_functions_metadata_only(&self, functions: Vec<FunctionInfo>) -> Result<()> {
+        // Edges are metadata, so they are written on this path too.
+        self.call_edge_store
+            .insert_from_functions(&functions)
+            .await?;
         // Insert functions metadata
         self.function_store.insert_metadata_only(functions).await?;
         Ok(())
@@ -1943,72 +1974,12 @@ impl DatabaseManager {
     pub async fn get_function_callers(&self, function_name: &str) -> Result<Vec<String>> {
         let total_start = std::time::Instant::now();
 
-        // Use efficient filtering: find functions whose calls JSON contains the target function name
-        let escaped_name = function_name.replace("'", "''"); // SQL escape
+        // Served by the call_edges table: a BTree point lookup on `callee`,
+        // rather than a scan over every row of `functions`.
+        let edges = self.call_edge_store.find_callers(function_name).await?;
 
-        let open_table_start = std::time::Instant::now();
-        let table = self.connection.open_table("functions").execute().await?;
-        tracing::info!(
-            "get_function_callers: open_table took {:?}",
-            open_table_start.elapsed()
-        );
-
-        // Filter for functions whose calls column contains the exact function name
-        // Match as complete JSON array element: "name", or "name"]
-        // This avoids false positives like "name_suffix" or "prefix_name"
-        // Exact element match; the JSON encoding this replaces could only be
-        // matched with a leading-wildcard LIKE plus a false-positive pass.
-        let filter = format!("array_has_any(calls, ['{escaped_name}'])");
-
-        let query_start = std::time::Instant::now();
-        let results = table
-            .query()
-            .only_if(filter)
-            .execute()
-            .await?
-            .try_collect::<Vec<_>>()
-            .await?;
-        tracing::info!(
-            "get_function_callers: query and collect took {:?}",
-            query_start.elapsed()
-        );
-
-        let process_start = std::time::Instant::now();
-        let mut callers = std::collections::HashSet::new();
-        for batch in results {
-            if batch.num_rows() > 0 {
-                let name_array = batch
-                    .column(0)
-                    .as_any()
-                    .downcast_ref::<arrow::array::StringArray>()
-                    .unwrap();
-
-                // Find the calls column (should be at index based on schema)
-                let calls_column_idx = batch
-                    .schema()
-                    .fields()
-                    .iter()
-                    .position(|f| f.name() == "calls")
-                    .ok_or_else(|| anyhow::anyhow!("calls column not found in functions table"))?;
-                let calls_array = batch
-                    .column(calls_column_idx)
-                    .as_any()
-                    .downcast_ref::<arrow::array::ListArray>()
-                    .ok_or_else(|| anyhow::anyhow!("calls column is not a list"))?;
-
-                for i in 0..batch.num_rows() {
-                    if let Some(calls_list) = super::read_string_list(calls_array, i) {
-                        if calls_list.iter().any(|c| c == function_name) {
-                            callers.insert(name_array.value(i).to_string());
-                        }
-                    }
-                }
-            }
-        }
-        tracing::info!(
-            "get_function_callers: batch processing took {:?}",
-            process_start.elapsed()
-        );
+        let callers: std::collections::HashSet<String> =
+            edges.into_iter().map(|e| e.caller).collect();
 
         let result: Vec<String> = callers.into_iter().collect();
         tracing::info!(
@@ -2029,10 +2000,10 @@ impl DatabaseManager {
         let mut caller_names: Vec<String> =
             workdir_callers.iter().map(|f| f.name.clone()).collect();
 
-        let git_manifest = self.generate_git_manifest(git_sha).await?;
-        if !git_manifest.is_empty() {
+        let manifest_hashes = self.git_manifest_hashes(git_sha).await?;
+        if !manifest_hashes.is_empty() {
             let db_callers = self
-                .get_function_callers_with_manifest(function_name, &git_manifest)
+                .get_function_callers_with_manifest(function_name, &manifest_hashes)
                 .await?;
             for name in db_callers {
                 if !caller_names.contains(&name) {
@@ -2213,6 +2184,12 @@ impl DatabaseManager {
         } else {
             None
         };
+        // Reverse lookups filter on blob hashes rather than paths.
+        let manifest_hashes = if let Some(sha) = git_sha {
+            Some(self.git_manifest_hashes(sha).await?)
+        } else {
+            None
+        };
 
         let mut result = std::collections::HashSet::new();
         let mut to_visit = std::collections::VecDeque::new();
@@ -2253,8 +2230,8 @@ impl DatabaseManager {
                 }
 
                 if include_reverse {
-                    let callers = if let Some(manifest) = &git_manifest {
-                        self.get_function_callers_with_manifest(&func_name, manifest)
+                    let callers = if let Some(hashes) = &manifest_hashes {
+                        self.get_function_callers_with_manifest(&func_name, hashes)
                             .await?
                     } else {
                         self.get_function_callers(&func_name).await?
@@ -3662,6 +3639,27 @@ impl DatabaseManager {
         Ok(manifest)
     }
 
+    /// The set of blob hashes present at `git_sha`, cached per SHA.
+    pub async fn git_manifest_hashes(
+        &self,
+        git_sha: &str,
+    ) -> Result<Arc<std::collections::HashSet<String>>> {
+        if let Some(cached) = self.manifest_hash_cache.read().unwrap().get(git_sha) {
+            return Ok(Arc::clone(cached));
+        }
+
+        let manifest = self.generate_git_manifest(git_sha).await?;
+        let hashes: Arc<std::collections::HashSet<String>> =
+            Arc::new(manifest.values().cloned().collect());
+
+        self.manifest_hash_cache
+            .write()
+            .unwrap()
+            .insert(git_sha.to_string(), Arc::clone(&hashes));
+
+        Ok(hashes)
+    }
+
     /// Fallback callers search when not in git repository
     async fn find_callers_non_git_aware(&self, target_function: &str) -> Result<Vec<FunctionInfo>> {
         tracing::info!(
@@ -3933,74 +3931,26 @@ impl DatabaseManager {
     pub async fn get_function_callers_with_manifest(
         &self,
         function_name: &str,
-        git_manifest: &std::collections::HashMap<String, String>,
+        manifest_hashes: &std::collections::HashSet<String>,
     ) -> Result<Vec<String>> {
-        // Use efficient filtering: find functions whose calls JSON contains the target function name
-        let escaped_name = function_name.replace("'", "''"); // SQL escape
-        let table = self.connection.open_table("functions").execute().await?;
+        // BTree point lookup on call_edges.callee, then drop the edges whose
+        // caller version is not present at this commit.
+        //
+        // Membership against the commit's blob hashes, rather than a
+        // path-to-hash lookup, so the edge table need not carry the caller's
+        // path.  Two paths sharing a blob hash have identical content, so a
+        // match still means that function body exists at this commit.
+        let edges = self.call_edge_store.find_callers(function_name).await?;
 
-        // Filter for functions whose calls column contains the target function name
-        let filter = format!("array_has_any(calls, ['{escaped_name}'])");
-        let results = table
-            .query()
-            .only_if(filter)
-            .execute()
-            .await?
-            .try_collect::<Vec<_>>()
-            .await?;
-
-        let mut callers = Vec::new();
-
-        for batch in results {
-            if batch.num_rows() > 0 {
-                let name_array = batch
-                    .column(0)
-                    .as_any()
-                    .downcast_ref::<arrow::array::StringArray>()
-                    .unwrap();
-                let file_path_array = batch
-                    .column(1)
-                    .as_any()
-                    .downcast_ref::<arrow::array::StringArray>()
-                    .unwrap();
-                let git_file_hash_array = batch
-                    .column(2)
-                    .as_any()
-                    .downcast_ref::<arrow::array::StringArray>()
-                    .unwrap();
-
-                // Find the calls column
-                let calls_column_idx = batch
-                    .schema()
-                    .fields()
-                    .iter()
-                    .position(|f| f.name() == "calls")
-                    .ok_or_else(|| anyhow::anyhow!("calls column not found in functions table"))?;
-                let calls_array = batch
-                    .column(calls_column_idx)
-                    .as_any()
-                    .downcast_ref::<arrow::array::ListArray>()
-                    .ok_or_else(|| anyhow::anyhow!("calls column is not a list"))?;
-
-                for i in 0..batch.num_rows() {
-                    let caller_name = name_array.value(i);
-                    let file_path = file_path_array.value(i);
-                    let git_file_hash = git_file_hash_array.value(i).to_string();
-
-                    // Fast manifest lookup instead of expensive git resolution
-                    if let Some(expected_hash) = git_manifest.get(file_path) {
-                        if &git_file_hash == expected_hash {
-                            // This function exists at the git SHA, verify it actually calls our target
-                            if let Some(calls_list) = super::read_string_list(calls_array, i) {
-                                {
-                                    if calls_list.iter().any(|c| c == function_name) {
-                                        callers.push(caller_name.to_string());
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
+        let mut callers = Vec::with_capacity(edges.len());
+        for edge in edges {
+            // Present at this commit if any version of the caller's file is.
+            if edge
+                .caller_git_file_hashes
+                .iter()
+                .any(|h| manifest_hashes.contains(h))
+            {
+                callers.push(edge.caller);
             }
         }
 

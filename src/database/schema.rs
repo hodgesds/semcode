@@ -70,6 +70,10 @@ impl SchemaManager {
             self.create_symbol_filename_table().await?;
         }
 
+        if !table_names.iter().any(|n| n == "call_edges") {
+            self.create_call_edges_table().await?;
+        }
+
         if !table_names.iter().any(|n| n == "git_commits") {
             self.create_git_commits_table().await?;
         }
@@ -259,6 +263,36 @@ impl SchemaManager {
 
         self.connection
             .create_table("processed_files", vec![empty_batch])
+            .execute()
+            .await?;
+
+        Ok(())
+    }
+
+    /// One row per reverse relationship edge.
+    ///
+    /// Exists because "who calls X" is a whole-table question when the answer
+    /// lives in each caller's own row, no matter how that row encodes it. Here
+    /// it is a BTree point lookup on `callee` instead.
+    async fn create_call_edges_table(&self) -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("callee", DataType::Utf8, false), // Referenced symbol - the lookup key
+            Field::new("caller", DataType::Utf8, false), // Symbol containing the reference
+            // Every blob hash the caller was seen in, as one row per
+            // (callee, caller) pair rather than one per version.  A symbol has
+            // a row per commit that touched its file, so without this a high
+            // fan-in lookup reads history-amplified duplicates that differ
+            // only in this hash -- 453839 rows to return 66882 callers on the
+            // 120-commit corpus.  Git filtering is a membership test against
+            // the commit's hashes, so the caller's path is not needed.
+            string_list_field("caller_git_file_hashes"),
+            Field::new("kind", DataType::Utf8, false), // Relationship kind, currently "call"
+        ]));
+
+        let empty_batch = RecordBatch::new_empty(schema.clone());
+
+        self.connection
+            .create_table("call_edges", vec![empty_batch])
             .execute()
             .await?;
 
@@ -596,7 +630,15 @@ impl SchemaManager {
         // Indices are refreshed independently of compaction and pruning.  Those
         // are gated on fragment counts and rewrite data files; this only needs
         // to happen because rows were appended.
-        for table_name in ["functions", "types", "macros", "content", "git_commits"] {
+        for table_name in [
+            "functions",
+            "types",
+            "macros",
+            "content",
+            "git_commits",
+            "call_edges",
+            "symbol_filename",
+        ] {
             if !table_names.iter().any(|n| n == table_name) {
                 continue;
             }
@@ -821,6 +863,17 @@ impl SchemaManager {
                 "Composite index on processed_files.(file,git_sha)",
             )
             .await;
+        }
+
+        // Create indices for call_edges table
+        if table_names.iter().any(|n| n == "call_edges") {
+            let table = self.connection.open_table("call_edges").execute().await?;
+
+            // The reverse lookup key.  Deliberately a BTree and not a
+            // LabelList: a bitmap probe reads bytes linear in table size,
+            // while this stays roughly logarithmic.
+            self.try_create_index(&table, &["callee"], "BTree index on call_edges.callee")
+                .await;
         }
 
         // Create indices for symbol_filename table
