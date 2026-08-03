@@ -11,6 +11,7 @@ use lancedb::database::listing::ListingDatabaseOptions;
 use lancedb::index::scalar::FullTextSearchQuery;
 use lancedb::query::ExecutableQuery;
 use lancedb::query::QueryBase;
+use std::sync::Arc;
 
 use crate::database::branches::IndexedBranchStore;
 use crate::database::functions::FunctionStore;
@@ -44,6 +45,15 @@ pub struct DatabaseManager {
     symbol_filename_store: SymbolFilenameStore,
     branch_store: IndexedBranchStore,
     workdir_index: std::sync::RwLock<Option<WorkdirIndex>>,
+    /// Tree manifests keyed by commit SHA.
+    ///
+    /// A manifest is the whole tree at a commit -- ~85k entries on the kernel --
+    /// and it was being rebuilt by walking git on every git-aware query.  The
+    /// tree at a commit is immutable, so one walk per SHA is enough.  Cleared
+    /// when the workdir overlay changes, since that is merged into the result.
+    manifest_cache: std::sync::RwLock<
+        std::collections::HashMap<String, Arc<std::collections::HashMap<String, String>>>,
+    >,
 }
 
 impl DatabaseManager {
@@ -70,6 +80,7 @@ impl DatabaseManager {
             symbol_filename_store: SymbolFilenameStore::new(connection.clone()),
             branch_store: IndexedBranchStore::new(connection.clone()),
             workdir_index: std::sync::RwLock::new(None),
+            manifest_cache: std::sync::RwLock::new(std::collections::HashMap::new()),
         })
     }
 
@@ -88,6 +99,8 @@ impl DatabaseManager {
     /// working directory overlay with database results.
     pub fn set_workdir_index(&self, workdir: WorkdirIndex) {
         *self.workdir_index.write().unwrap() = Some(workdir);
+        // Cached manifests have the old overlay merged in.
+        self.manifest_cache.write().unwrap().clear();
     }
 
     /// Check if a workdir index is set.
@@ -3638,7 +3651,11 @@ impl DatabaseManager {
     pub async fn generate_git_manifest(
         &self,
         git_sha: &str,
-    ) -> Result<std::collections::HashMap<String, String>> {
+    ) -> Result<Arc<std::collections::HashMap<String, String>>> {
+        if let Some(cached) = self.manifest_cache.read().unwrap().get(git_sha) {
+            return Ok(Arc::clone(cached));
+        }
+
         let mut manifest = std::collections::HashMap::new();
 
         // Use shared tree traversal utility
@@ -3654,7 +3671,14 @@ impl DatabaseManager {
         )?;
 
         // Merge with workdir overlay (adds dirty files, removes deleted files)
-        Ok(self.workdir_merged_manifest(manifest))
+        let manifest = Arc::new(self.workdir_merged_manifest(manifest));
+
+        self.manifest_cache
+            .write()
+            .unwrap()
+            .insert(git_sha.to_string(), Arc::clone(&manifest));
+
+        Ok(manifest)
     }
 
     /// Fallback callers search when not in git repository
