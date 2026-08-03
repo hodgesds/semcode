@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 use anyhow::Result;
 use arrow::array::{
-    Array, ArrayRef, Int64Builder, RecordBatch, RecordBatchIterator, StringArray, StringBuilder,
+    Array, ArrayRef, Int64Builder, ListArray, ListBuilder, RecordBatch, RecordBatchIterator,
+    StringArray, StringBuilder,
 };
 use futures::TryStreamExt;
 use lancedb::connection::Connection;
@@ -10,7 +11,7 @@ use std::sync::Arc;
 
 use crate::database::connection::OPTIMAL_BATCH_SIZE;
 use crate::database::content::ContentStore;
-use crate::database::get_column;
+use crate::database::{get_column, read_string_list};
 use crate::types::{FunctionInfo, ParameterInfo};
 
 #[derive(Debug, Clone)]
@@ -117,8 +118,8 @@ impl FunctionStore {
         let mut line_end_builder = Int64Builder::new();
         let mut return_type_builder = StringBuilder::new();
         let mut parameters_builder = StringBuilder::new();
-        let mut calls_builder = StringBuilder::new();
-        let mut types_builder = StringBuilder::new();
+        let mut calls_builder = ListBuilder::new(StringBuilder::new());
+        let mut types_builder = ListBuilder::new(StringBuilder::new());
 
         for func in functions {
             name_builder.append_value(&func.name);
@@ -129,18 +130,10 @@ impl FunctionStore {
             return_type_builder.append_value(&func.return_type);
             parameters_builder.append_value(serde_json::to_string(&func.parameters)?);
 
-            // Serialize calls and types to JSON strings (nullable)
-            if let Some(ref calls) = func.calls {
-                calls_builder.append_value(serde_json::to_string(calls)?);
-            } else {
-                calls_builder.append_null();
-            }
-
-            if let Some(ref types) = func.types {
-                types_builder.append_value(serde_json::to_string(types)?);
-            } else {
-                types_builder.append_null();
-            }
+            // Typed lists rather than JSON text: no parse on read, and the
+            // values dictionary-encode.
+            crate::database::append_string_list(&mut calls_builder, func.calls.as_deref());
+            crate::database::append_string_list(&mut types_builder, func.types.as_deref());
         }
 
         // Create body_hash StringArray (nullable for empty bodies)
@@ -210,8 +203,8 @@ impl FunctionStore {
         let mut line_end_builder = arrow::array::Int64Builder::new();
         let mut return_type_builder = StringBuilder::new();
         let mut parameters_builder = StringBuilder::new();
-        let mut calls_builder = StringBuilder::new();
-        let mut types_builder = StringBuilder::new();
+        let mut calls_builder = ListBuilder::new(StringBuilder::new());
+        let mut types_builder = ListBuilder::new(StringBuilder::new());
 
         for func in functions {
             name_builder.append_value(&func.name);
@@ -224,20 +217,8 @@ impl FunctionStore {
             let parameters_json = serde_json::to_string(&func.parameters).unwrap_or_default();
             parameters_builder.append_value(&parameters_json);
 
-            // Handle calls and types as JSON arrays
-            let calls_json = func
-                .calls
-                .as_ref()
-                .map(|calls| serde_json::to_string(calls).unwrap_or_default())
-                .unwrap_or_default();
-            calls_builder.append_value(&calls_json);
-
-            let types_json = func
-                .types
-                .as_ref()
-                .map(|types| serde_json::to_string(types).unwrap_or_default())
-                .unwrap_or_default();
-            types_builder.append_value(&types_json);
+            crate::database::append_string_list(&mut calls_builder, func.calls.as_deref());
+            crate::database::append_string_list(&mut types_builder, func.types.as_deref());
         }
 
         // Create body_hash StringArray (non-nullable for metadata-only)
@@ -547,8 +528,8 @@ impl FunctionStore {
         let return_type_array = get_column::<StringArray>(batch, "return_type")?;
         let parameters_array = get_column::<StringArray>(batch, "parameters")?;
         let body_hash_array = get_column::<StringArray>(batch, "body_hash")?;
-        let calls_array = get_column::<StringArray>(batch, "calls")?;
-        let types_array = get_column::<StringArray>(batch, "types")?;
+        let calls_array = get_column::<ListArray>(batch, "calls")?;
+        let types_array = get_column::<ListArray>(batch, "types")?;
 
         let parameters: Vec<ParameterInfo> =
             serde_json::from_str::<Vec<ParameterInfo>>(parameters_array.value(row))?;
@@ -560,18 +541,8 @@ impl FunctionStore {
             Some(body_hash_array.value(row).to_string())
         };
 
-        // Parse calls and types from JSON (they're nullable)
-        let calls = if calls_array.is_null(row) {
-            None
-        } else {
-            serde_json::from_str::<Vec<String>>(calls_array.value(row)).ok()
-        };
-
-        let types = if types_array.is_null(row) {
-            None
-        } else {
-            serde_json::from_str::<Vec<String>>(types_array.value(row)).ok()
-        };
+        let calls = read_string_list(calls_array, row);
+        let types = read_string_list(types_array, row);
 
         Ok(Some(FunctionMetadata {
             name: name_array.value(row).to_string(),

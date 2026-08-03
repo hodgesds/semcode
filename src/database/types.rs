@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 use anyhow::Result;
 use arrow::array::{
-    Array, ArrayRef, Int64Builder, RecordBatch, RecordBatchIterator, StringArray, StringBuilder,
+    Array, ArrayRef, Int64Builder, ListArray, ListBuilder, RecordBatch, RecordBatchIterator,
+    StringArray, StringBuilder,
 };
 use futures::TryStreamExt;
 use lancedb::connection::Connection;
@@ -108,7 +109,7 @@ impl TypeStore {
         let mut kind_builder = StringBuilder::new();
         let mut size_builder = Int64Builder::new();
         let mut fields_builder = StringBuilder::new();
-        let mut types_builder = StringBuilder::new();
+        let mut types_builder = ListBuilder::new(StringBuilder::new());
 
         for type_info in types {
             name_builder.append_value(&type_info.name);
@@ -125,12 +126,8 @@ impl TypeStore {
 
             fields_builder.append_value(serde_json::to_string(&type_info.members)?);
 
-            // Serialize types to JSON strings (nullable)
-            if let Some(ref types_list) = type_info.types {
-                types_builder.append_value(serde_json::to_string(types_list)?);
-            } else {
-                types_builder.append_null();
-            }
+            // Typed list rather than JSON text.
+            crate::database::append_string_list(&mut types_builder, type_info.types.as_deref());
         }
 
         // Create definition_hash strings (nullable for empty definitions) - unused, keeping for documentation
@@ -204,7 +201,7 @@ impl TypeStore {
         let mut kind_builder = StringBuilder::new();
         let mut size_builder = Int64Builder::new();
         let mut fields_builder = StringBuilder::new();
-        let mut types_builder = StringBuilder::new();
+        let mut types_builder = ListBuilder::new(StringBuilder::new());
 
         for type_info in types {
             name_builder.append_value(&type_info.name);
@@ -217,13 +214,7 @@ impl TypeStore {
             let fields_json = serde_json::to_string(&type_info.members).unwrap_or_default();
             fields_builder.append_value(&fields_json);
 
-            // Handle types as JSON array
-            let types_json = type_info
-                .types
-                .as_ref()
-                .map(|ts| serde_json::to_string(ts).unwrap_or_default())
-                .unwrap_or_default();
-            types_builder.append_value(&types_json);
+            crate::database::append_string_list(&mut types_builder, type_info.types.as_deref());
         }
 
         let mut definition_hash_builder = StringBuilder::new();
@@ -500,11 +491,7 @@ impl TypeStore {
             .as_any()
             .downcast_ref::<StringArray>()
             .unwrap();
-        let types_array = batch
-            .column(8)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
+        let types_array = crate::database::get_column::<ListArray>(batch, "types")?;
 
         let fields: Vec<FieldInfo> = serde_json::from_str(fields_array.value(row))?;
         let size = if size_array.is_null(row) {
@@ -520,12 +507,7 @@ impl TypeStore {
             Some(definition_hash_array.value(row).to_string())
         };
 
-        // Parse types from JSON (nullable)
-        let types = if types_array.is_null(row) {
-            None
-        } else {
-            serde_json::from_str::<Vec<String>>(types_array.value(row)).ok()
-        };
+        let types = crate::database::read_string_list(types_array, row);
 
         Ok(Some(TypeMetadata {
             name: name_array.value(row).to_string(),
@@ -717,11 +699,7 @@ impl TypeStore {
             .as_any()
             .downcast_ref::<StringArray>()
             .unwrap();
-        let types_array = batch
-            .column(8)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
+        let types_array = crate::database::get_column::<ListArray>(batch, "types")?;
 
         let fields: Vec<FieldInfo> = serde_json::from_str(fields_array.value(row))?;
         let size = if size_array.is_null(row) {
@@ -747,12 +725,7 @@ impl TypeStore {
             }
         };
 
-        // Parse types from JSON (nullable)
-        let types = if types_array.is_null(row) {
-            None
-        } else {
-            serde_json::from_str::<Vec<String>>(types_array.value(row)).ok()
-        };
+        let types = crate::database::read_string_list(types_array, row);
 
         Ok(Some(TypeInfo {
             name: name_array.value(row).to_string(),

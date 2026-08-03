@@ -25,6 +25,19 @@ pub struct SchemaManager {
     connection: Connection,
 }
 
+/// A nullable `List<Utf8>` column.
+///
+/// Relationships were originally JSON text, which meant parsing every value on
+/// read and storing the punctuation on disk.  A typed list drops the parse and
+/// compresses better.
+fn string_list_field(name: &str) -> Field {
+    Field::new(
+        name,
+        DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+        true,
+    )
+}
+
 impl SchemaManager {
     pub fn new(connection: Connection) -> Self {
         Self { connection }
@@ -32,6 +45,10 @@ impl SchemaManager {
 
     pub async fn create_all_tables(&self) -> Result<()> {
         let table_names = self.connection.table_names().execute().await?;
+
+        // Before creating anything, so an incompatible database is not
+        // modified on the way to being rejected.
+        self.check_relationship_columns(&table_names).await?;
 
         if !table_names.iter().any(|n| n == "functions") {
             self.create_functions_table().await?;
@@ -85,6 +102,39 @@ impl SchemaManager {
         Ok(())
     }
 
+    /// Refuse to operate on a database written before relationships became
+    /// lists.
+    ///
+    /// The reader downcasts `calls` and `types` to a list array. Against the
+    /// older text encoding that produces no relationships rather than an
+    /// error, so a stale database looks like a codebase where nothing calls
+    /// anything -- the worst way for this to fail. Check the column type up
+    /// front and say what to do about it.
+    async fn check_relationship_columns(&self, table_names: &[String]) -> Result<()> {
+        if !table_names.iter().any(|n| n == "functions") {
+            return Ok(());
+        }
+
+        let table = self.connection.open_table("functions").execute().await?;
+        let schema = table.schema().await?;
+        let Ok(calls) = schema.field_with_name("calls") else {
+            return Ok(());
+        };
+
+        if !matches!(calls.data_type(), DataType::List(_)) {
+            anyhow::bail!(
+                "database at {} predates the list relationship schema \
+                 (functions.calls is {} rather than a list).\n\
+                 Call and type relationships would come back empty. \
+                 Reindex to upgrade:\n    semcode-index --source <path>",
+                self.connection.uri(),
+                calls.data_type()
+            );
+        }
+
+        Ok(())
+    }
+
     pub async fn create_functions_table(&self) -> Result<()> {
         let schema = Arc::new(Schema::new(vec![
             Field::new("name", DataType::Utf8, false),
@@ -95,8 +145,8 @@ impl SchemaManager {
             Field::new("return_type", DataType::Utf8, false),
             Field::new("parameters", DataType::Utf8, false),
             Field::new("body_hash", DataType::Utf8, true), // Blake3 hash referencing content table as hex string (nullable for empty bodies)
-            Field::new("calls", DataType::Utf8, true), // JSON array of function names called by this function
-            Field::new("types", DataType::Utf8, true), // JSON array of type names used by this function
+            string_list_field("calls"),
+            string_list_field("types"),
         ]));
 
         let empty_batch = RecordBatch::new_empty(schema.clone());
@@ -119,7 +169,7 @@ impl SchemaManager {
             Field::new("size", DataType::Int64, true),
             Field::new("fields", DataType::Utf8, false),
             Field::new("definition_hash", DataType::Utf8, true), // Blake3 hash referencing content table as hex string (nullable for empty definitions)
-            Field::new("types", DataType::Utf8, true), // JSON array of type names referenced by this type
+            string_list_field("types"),
         ]));
 
         let empty_batch = RecordBatch::new_empty(schema.clone());

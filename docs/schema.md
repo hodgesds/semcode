@@ -57,8 +57,8 @@ line_end            (Int64, NOT NULL)    - Ending line number
 return_type         (Utf8, NOT NULL)     - Function return type
 parameters          (Utf8, NOT NULL)     - JSON-encoded parameter list
 body_hash           (Utf8, nullable)     - Blake3 hash referencing content table as hex string (nullable for empty bodies)
-calls               (Utf8, nullable)     - JSON array of function names called by this function
-types               (Utf8, nullable)     - JSON array of type names used by this function
+calls               (List<Utf8>, nullable) - Function names called by this function
+types               (List<Utf8>, nullable) - Type names used by this function
 ```
 
 **Content Storage:**
@@ -77,8 +77,6 @@ types               (Utf8, nullable)     - JSON array of type names used by this
 - BTree on `git_file_hash` (content-based lookups)
 - BTree on `file_path` (file-based queries)
 - BTree on `body_hash` (content reference lookups)
-- BTree on `calls` (function call relationship queries)
-- BTree on `types` (type relationship queries)
 - BTree on `line_start` (line-based queries and sorting)
 - BTree on `line_end` (range-based queries)
 - Composite on `(name, git_file_hash)` (duplicate checking)
@@ -97,7 +95,7 @@ kind                (Utf8, NOT NULL)     - Type kind: "struct", "union", "enum",
 size                (Int64, nullable)    - Size in bytes (if available)
 fields              (Utf8, NOT NULL)     - JSON string of field/member information
 definition_hash     (Utf8, nullable)     - Blake3 hash referencing content table as hex string (nullable for empty definitions)
-types               (Utf8, nullable)     - JSON array of type names referenced by this type
+types               (List<Utf8>, nullable) - Type names referenced by this type
 ```
 
 **Content Storage:**
@@ -443,30 +441,31 @@ let body_content = content_store.get_content(&function.body_hash).await?;
 - **Scalability**: Each shard maintains optimal size for performance
 - **Load Distribution**: Content evenly distributed across all shards
 
-### Embedded JSON Relationships
+### Embedded List Relationships
 
-**Function calls example (optimized with BTree index on calls):**
-```sql
--- Find all functions that call 'malloc'
-SELECT name, file_path FROM functions
-WHERE calls IS NOT NULL AND calls LIKE '%"malloc"%'
-```
+`calls` and `types` are `List<Utf8>` columns. They are read as forward edges --
+given a function, what it calls -- and are colocated with a row the caller has
+usually already fetched.
 
-**Type dependencies example (optimized with BTree index on types):**
-```sql
--- Find all functions that use 'struct node'
-SELECT name, file_path FROM functions
-WHERE types IS NOT NULL AND types LIKE '%"struct node"%'
+These columns previously held JSON text, so every read paid a parse and the
+punctuation was stored on disk. Typed lists drop the parse and the values
+dictionary-encode, which cut the database ~32%.
 
--- Find all types that reference 'struct node'
-SELECT name, kind FROM types
-WHERE types IS NOT NULL AND types LIKE '%"struct node"%'
-```
+Reverse lookups ("who calls X") are served by the `call_edges` table, not by an
+index on these columns. A LabelList index over `calls` was measured and removed:
+a bitmap probe reads bytes linear in table size, so it never beat a sorted edge
+table with a BTree.
 
-**Performance benefits:**
-- **Indexed JSON searches**: BTree indices on `calls` and `types` columns enable O(log n) relationship queries
-- **Pattern matching optimization**: LIKE queries on JSON arrays benefit from index pre-filtering
-- **Dependency analysis**: Fast discovery of function call chains and type usage patterns
+One thing the JSON encoding could express that lists cannot: substring matches
+*within* an element, e.g. `types LIKE '%"*"%'` to find every pointer type. That
+needs an unnest or a separate derived column now. No query in the tool relied
+on it.
+
+**Index coverage:** a Lance index only covers rows that existed when it was
+built. Indexing calls `optimize_scalar_indices()` at the end of a run to refresh
+coverage; without it the planner silently falls back to a full scan. Check with
+`cargo run --example list-indices -- <db> functions`, which prints
+indexed/unindexed row counts.
 
 ### Git SHA-based Content Tracking
 
@@ -545,17 +544,12 @@ WHERE t.name = 'user_data' AND t.definition_hash LIKE '3%'
 
 ### Relationship Queries
 ```sql
--- Find callers of a function (uses BTree index on calls)
-SELECT name, file_path FROM functions
-WHERE calls IS NOT NULL AND calls LIKE '%"target_function"%'
+-- Find callers of a function (BTree index on call_edges.callee)
+SELECT caller FROM call_edges
+WHERE callee = 'target_function' AND kind = 'call'
 
--- Find functions using a specific type (uses BTree index on types)
-SELECT name, file_path FROM functions
-WHERE types IS NOT NULL AND types LIKE '%"struct user_data"%'
-
--- Find all functions that use pointer types
-SELECT name, file_path FROM functions
-WHERE types IS NOT NULL AND types LIKE '%"*"%'
+-- Forward edges come from the function's own row
+SELECT calls, types FROM functions WHERE name = 'target_function' 
 ```
 
 ### Line-based and Location Queries

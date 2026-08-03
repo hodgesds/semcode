@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 use crate::CallRelationship;
 use anyhow::Result;
-use arrow::array::{Array, StringArray};
+use arrow::array::{Array, ListArray, StringArray};
 use arrow::record_batch::RecordBatch;
 use colored::*;
 use futures::TryStreamExt;
@@ -953,8 +953,8 @@ impl DatabaseManager {
                 let types_array = batch
                     .column(types_column_idx)
                     .as_any()
-                    .downcast_ref::<arrow::array::StringArray>()
-                    .unwrap();
+                    .downcast_ref::<arrow::array::ListArray>()
+                    .ok_or_else(|| anyhow::anyhow!("types column is not a list"))?;
 
                 for i in 0..batch.num_rows() {
                     let file_path = file_path_array.value(i);
@@ -963,12 +963,7 @@ impl DatabaseManager {
                     // Check if this function exists at the target git SHA
                     if let Some(expected_hash) = git_manifest.get(file_path) {
                         if git_file_hash == expected_hash {
-                            // Parse the types JSON
-                            let types = if types_array.is_null(i) {
-                                None
-                            } else {
-                                serde_json::from_str::<Vec<String>>(types_array.value(i)).ok()
-                            };
+                            let types = super::read_string_list(types_array, i);
 
                             matches.push((
                                 file_path.to_string(),
@@ -1833,8 +1828,8 @@ impl DatabaseManager {
                 let paths: &StringArray = super::get_column(&batch, "file_path")?;
                 let hashes: &StringArray = super::get_column(&batch, "git_file_hash")?;
                 let lines: &arrow::array::Int64Array = super::get_column(&batch, "line_start")?;
-                let calls: &StringArray = super::get_column(&batch, "calls")?;
-                let types: &StringArray = super::get_column(&batch, "types")?;
+                let calls: &ListArray = super::get_column(&batch, "calls")?;
+                let types: &ListArray = super::get_column(&batch, "types")?;
 
                 for row in 0..batch.num_rows() {
                     let path = paths.value(row);
@@ -1850,27 +1845,23 @@ impl DatabaseManager {
                         lines.value(row),
                         names.value(row)
                     );
-                    if !calls.is_null(row) {
-                        if let Ok(values) = serde_json::from_str::<Vec<String>>(calls.value(row)) {
-                            for target in values {
-                                if function_targets.contains(&target) {
-                                    function_referrers
-                                        .entry(target)
-                                        .or_default()
-                                        .insert(identity.clone());
-                                }
+                    if let Some(values) = super::read_string_list(calls, row) {
+                        for target in values {
+                            if function_targets.contains(&target) {
+                                function_referrers
+                                    .entry(target)
+                                    .or_default()
+                                    .insert(identity.clone());
                             }
                         }
                     }
-                    if !types.is_null(row) {
-                        if let Ok(values) = serde_json::from_str::<Vec<String>>(types.value(row)) {
-                            for target in values {
-                                if type_targets.contains(&target) {
-                                    type_referrers
-                                        .entry(target)
-                                        .or_default()
-                                        .insert(identity.clone());
-                                }
+                    if let Some(values) = super::read_string_list(types, row) {
+                        for target in values {
+                            if type_targets.contains(&target) {
+                                type_referrers
+                                    .entry(target)
+                                    .or_default()
+                                    .insert(identity.clone());
                             }
                         }
                     }
@@ -1899,7 +1890,7 @@ impl DatabaseManager {
                     let paths: &StringArray = super::get_column(&batch, "file_path")?;
                     let hashes: &StringArray = super::get_column(&batch, "git_file_hash")?;
                     let lines: &arrow::array::Int64Array = super::get_column(&batch, "line")?;
-                    let types: &StringArray = super::get_column(&batch, "types")?;
+                    let types: &ListArray = super::get_column(&batch, "types")?;
 
                     for row in 0..batch.num_rows() {
                         let path = paths.value(row);
@@ -1909,12 +1900,9 @@ impl DatabaseManager {
                         if git_manifest.get(path).map(String::as_str) != Some(hashes.value(row)) {
                             continue;
                         }
-                        if types.is_null(row) {
-                            continue;
-                        }
                         let identity =
                             format!("type:{}:{}:{}", path, lines.value(row), names.value(row));
-                        if let Ok(values) = serde_json::from_str::<Vec<String>>(types.value(row)) {
+                        if let Some(values) = super::read_string_list(types, row) {
                             for target in values {
                                 if type_targets.contains(&target) {
                                     type_referrers
@@ -1974,9 +1962,9 @@ impl DatabaseManager {
         // Filter for functions whose calls column contains the exact function name
         // Match as complete JSON array element: "name", or "name"]
         // This avoids false positives like "name_suffix" or "prefix_name"
-        let filter = format!(
-            "calls IS NOT NULL AND (calls LIKE '%\"{escaped_name}\",%' OR calls LIKE '%\"{escaped_name}\"]%')"
-        );
+        // Exact element match; the JSON encoding this replaces could only be
+        // matched with a leading-wildcard LIKE plus a false-positive pass.
+        let filter = format!("array_has_any(calls, ['{escaped_name}'])");
 
         let query_start = std::time::Instant::now();
         let results = table
@@ -2011,20 +1999,13 @@ impl DatabaseManager {
                 let calls_array = batch
                     .column(calls_column_idx)
                     .as_any()
-                    .downcast_ref::<arrow::array::StringArray>()
-                    .unwrap();
+                    .downcast_ref::<arrow::array::ListArray>()
+                    .ok_or_else(|| anyhow::anyhow!("calls column is not a list"))?;
 
                 for i in 0..batch.num_rows() {
-                    if !calls_array.is_null(i) {
-                        let caller_name = name_array.value(i).to_string();
-                        let calls_json = calls_array.value(i);
-
-                        // Parse JSON and verify it actually contains function_name
-                        // (the LIKE filter might have false positives)
-                        if let Ok(calls_list) = serde_json::from_str::<Vec<String>>(calls_json) {
-                            if calls_list.contains(&function_name.to_string()) {
-                                callers.insert(caller_name);
-                            }
+                    if let Some(calls_list) = super::read_string_list(calls_array, i) {
+                        if calls_list.iter().any(|c| c == function_name) {
+                            callers.insert(name_array.value(i).to_string());
                         }
                     }
                 }
@@ -2102,22 +2083,19 @@ impl DatabaseManager {
                 let calls_array = batch
                     .column(calls_column_idx)
                     .as_any()
-                    .downcast_ref::<arrow::array::StringArray>()
-                    .unwrap();
+                    .downcast_ref::<arrow::array::ListArray>()
+                    .ok_or_else(|| anyhow::anyhow!("calls column is not a list"))?;
 
                 for i in 0..batch.num_rows() {
                     let function_name = name_array.value(i).to_string();
 
                     // Check if this function makes calls
-                    if !calls_array.is_null(i) {
-                        let calls_json = calls_array.value(i);
-                        if let Ok(calls_list) = serde_json::from_str::<Vec<String>>(calls_json) {
-                            if !calls_list.is_empty() {
-                                functions_with_calls.insert(function_name.clone());
-                                // Add all called functions to the set
-                                for called_func in calls_list {
-                                    functions_that_are_called.insert(called_func);
-                                }
+                    if let Some(calls_list) = super::read_string_list(calls_array, i) {
+                        if !calls_list.is_empty() {
+                            functions_with_calls.insert(function_name.clone());
+                            // Add all called functions to the set
+                            for called_func in calls_list {
+                                functions_that_are_called.insert(called_func);
                             }
                         }
                     }
@@ -2374,16 +2352,15 @@ impl DatabaseManager {
                 let calls_array = batch
                     .column(calls_column_idx)
                     .as_any()
-                    .downcast_ref::<arrow::array::StringArray>()
-                    .unwrap();
+                    .downcast_ref::<arrow::array::ListArray>()
+                    .ok_or_else(|| anyhow::anyhow!("calls column is not a list"))?;
 
                 for i in 0..batch.num_rows() {
                     let caller_name = name_array.value(i).to_string();
                     let caller_git_file_hash = git_file_hash_array.value(i).to_string();
 
-                    if !calls_array.is_null(i) {
-                        let calls_json = calls_array.value(i);
-                        if let Ok(calls_list) = serde_json::from_str::<Vec<String>>(calls_json) {
+                    if let Some(calls_list) = super::read_string_list(calls_array, i) {
+                        {
                             for callee_name in calls_list {
                                 // For now, we can't easily get callee git hash without additional lookups
                                 // This is a limitation of the new schema - we'd need to do individual lookups
@@ -3837,8 +3814,8 @@ impl DatabaseManager {
                 let calls_array = batch
                     .column(calls_column_idx)
                     .as_any()
-                    .downcast_ref::<arrow::array::StringArray>()
-                    .unwrap();
+                    .downcast_ref::<arrow::array::ListArray>()
+                    .ok_or_else(|| anyhow::anyhow!("calls column is not a list"))?;
 
                 for i in 0..batch.num_rows() {
                     let file_path = file_path_array.value(i);
@@ -3847,12 +3824,7 @@ impl DatabaseManager {
                     // Fast manifest lookup
                     if let Some(expected_hash) = git_manifest.get(file_path) {
                         if git_file_hash == expected_hash {
-                            // Parse the calls JSON
-                            let calls = if calls_array.is_null(i) {
-                                None
-                            } else {
-                                serde_json::from_str::<Vec<String>>(calls_array.value(i)).ok()
-                            };
+                            let calls = super::read_string_list(calls_array, i);
 
                             // Collect lightweight info for selection
                             matches.push((
@@ -3935,8 +3907,8 @@ impl DatabaseManager {
                 let calls_array = batch
                     .column(calls_column_idx)
                     .as_any()
-                    .downcast_ref::<arrow::array::StringArray>()
-                    .unwrap();
+                    .downcast_ref::<arrow::array::ListArray>()
+                    .ok_or_else(|| anyhow::anyhow!("calls column is not a list"))?;
 
                 for i in 0..batch.num_rows() {
                     let file_path = file_path_array.value(i);
@@ -3946,9 +3918,7 @@ impl DatabaseManager {
                     if let Some(expected_hash) = git_manifest.get(file_path) {
                         if git_file_hash == expected_hash {
                             let caller_name = name_array.value(i);
-                            if !calls_array.is_null(i) {
-                                if let Ok(calls_list) =
-                                    serde_json::from_str::<Vec<String>>(calls_array.value(i))
+                            if let Some(calls_list) = super::read_string_list(calls_array, i) {
                                 {
                                     for callee in calls_list {
                                         caller_index
@@ -3983,7 +3953,7 @@ impl DatabaseManager {
         let table = self.connection.open_table("functions").execute().await?;
 
         // Filter for functions whose calls column contains the target function name
-        let filter = format!("calls IS NOT NULL AND calls LIKE '%\\\"{escaped_name}\\\"%%'");
+        let filter = format!("array_has_any(calls, ['{escaped_name}'])");
         let results = table
             .query()
             .only_if(filter)
@@ -4022,8 +3992,8 @@ impl DatabaseManager {
                 let calls_array = batch
                     .column(calls_column_idx)
                     .as_any()
-                    .downcast_ref::<arrow::array::StringArray>()
-                    .unwrap();
+                    .downcast_ref::<arrow::array::ListArray>()
+                    .ok_or_else(|| anyhow::anyhow!("calls column is not a list"))?;
 
                 for i in 0..batch.num_rows() {
                     let caller_name = name_array.value(i);
@@ -4034,12 +4004,9 @@ impl DatabaseManager {
                     if let Some(expected_hash) = git_manifest.get(file_path) {
                         if &git_file_hash == expected_hash {
                             // This function exists at the git SHA, verify it actually calls our target
-                            if !calls_array.is_null(i) {
-                                let calls_json = calls_array.value(i);
-                                if let Ok(calls_list) =
-                                    serde_json::from_str::<Vec<String>>(calls_json)
+                            if let Some(calls_list) = super::read_string_list(calls_array, i) {
                                 {
-                                    if calls_list.contains(&function_name.to_string()) {
+                                    if calls_list.iter().any(|c| c == function_name) {
                                         callers.push(caller_name.to_string());
                                     }
                                 }
