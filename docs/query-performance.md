@@ -449,6 +449,13 @@ Also outstanding, found while measuring:
   should assert coverage after indexing rather than trusting that
   `create_index` succeeded — that is how this went unnoticed.
 
+* The file survey was the last full scan on the git-aware path; it is now
+  served by `call_edges`, which also carries `kind = "type_use"` edges from
+  `functions.types` and `types.types`. That took survey from 0.53s to 0.27s
+  and grew the edge table only 17%, since type references collapse hard.
+  Referrer identity lost line-level granularity in the process: a
+  declaration and definition of one symbol in one file now count once.
+
 * `src/search.rs` and `src/database/search.rs` are separate query paths — the
   CLI uses the former, the DB API, MCP and benchmarks the latter. Optimising
   one while measuring the other cost a full cycle here.
