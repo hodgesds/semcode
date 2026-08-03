@@ -278,6 +278,9 @@ impl SchemaManager {
         let schema = Arc::new(Schema::new(vec![
             Field::new("callee", DataType::Utf8, false), // Referenced symbol - the lookup key
             Field::new("caller", DataType::Utf8, false), // Symbol containing the reference
+            // Needed to tell apart two same-named callers in different files.
+            // Free for lookups that do not select it, since Lance is columnar.
+            Field::new("caller_file_path", DataType::Utf8, false),
             // Every blob hash the caller was seen in, as one row per
             // (callee, caller) pair rather than one per version.  A symbol has
             // a row per commit that touched its file, so without this a high
@@ -286,7 +289,7 @@ impl SchemaManager {
             // 120-commit corpus.  Git filtering is a membership test against
             // the commit's hashes, so the caller's path is not needed.
             string_list_field("caller_git_file_hashes"),
-            Field::new("kind", DataType::Utf8, false), // Relationship kind, currently "call"
+            Field::new("kind", DataType::Utf8, false), // "call" or "type_use"
         ]));
 
         let empty_batch = RecordBatch::new_empty(schema.clone());

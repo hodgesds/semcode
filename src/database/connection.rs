@@ -1315,6 +1315,9 @@ impl DatabaseManager {
 
     // Type operations
     pub async fn insert_types(&self, types: Vec<TypeInfo>) -> Result<()> {
+        // Type-to-type reference edges, derived before the move below.
+        self.call_edge_store.insert_from_types(&types).await?;
+
         // Extract unique type definitions and store them in content table for deduplication
         let mut unique_definitions = std::collections::HashSet::new();
         for type_info in &types {
@@ -1755,6 +1758,7 @@ impl DatabaseManager {
     }
 
     async fn insert_types_metadata_only(&self, types: Vec<TypeInfo>) -> Result<()> {
+        self.call_edge_store.insert_from_types(&types).await?;
         self.type_store.insert_metadata_only(types).await
     }
 
@@ -1825,119 +1829,49 @@ impl DatabaseManager {
         let git_manifest = self.generate_git_manifest(git_sha).await?;
 
         if !git_manifest.is_empty() && (!function_targets.is_empty() || !type_targets.is_empty()) {
-            let functions_table = self.connection.open_table("functions").execute().await?;
-            let relationship_filter = match (function_targets.is_empty(), type_targets.is_empty()) {
-                (false, false) => "calls IS NOT NULL OR types IS NOT NULL",
-                (false, true) => "calls IS NOT NULL",
-                (true, false) => "types IS NOT NULL",
-                (true, true) => unreachable!(),
-            };
-            let batches = functions_table
-                .query()
-                .only_if(relationship_filter)
-                .select(lancedb::query::Select::Columns(vec![
-                    "name".to_string(),
-                    "file_path".to_string(),
-                    "git_file_hash".to_string(),
-                    "line_start".to_string(),
-                    "calls".to_string(),
-                    "types".to_string(),
-                ]))
-                .execute()
-                .await?
-                .try_collect::<Vec<_>>()
-                .await?;
+            // One indexed lookup over call_edges instead of scanning functions
+            // and types end to end.  Cost tracks the number of symbols asked
+            // about, not the size of the tables.
+            let mut wanted: Vec<String> = function_names.to_vec();
+            wanted.extend(type_names.iter().cloned());
+            wanted.sort_unstable();
+            wanted.dedup();
 
-            for batch in batches {
-                let names: &StringArray = super::get_column(&batch, "name")?;
-                let paths: &StringArray = super::get_column(&batch, "file_path")?;
-                let hashes: &StringArray = super::get_column(&batch, "git_file_hash")?;
-                let lines: &arrow::array::Int64Array = super::get_column(&batch, "line_start")?;
-                let calls: &ListArray = super::get_column(&batch, "calls")?;
-                let types: &ListArray = super::get_column(&batch, "types")?;
+            let manifest_hashes = self.git_manifest_hashes(git_sha).await?;
+            let edges = self.call_edge_store.find_referrers(&wanted).await?;
 
-                for row in 0..batch.num_rows() {
-                    let path = paths.value(row);
-                    if self.workdir_is_dirty(path) || self.workdir_is_deleted(path) {
-                        continue;
-                    }
-                    if git_manifest.get(path).map(String::as_str) != Some(hashes.value(row)) {
-                        continue;
-                    }
-                    let identity = format!(
-                        "function:{}:{}:{}",
-                        path,
-                        lines.value(row),
-                        names.value(row)
-                    );
-                    if let Some(values) = super::read_string_list(calls, row) {
-                        for target in values {
-                            if function_targets.contains(&target) {
-                                function_referrers
-                                    .entry(target)
-                                    .or_default()
-                                    .insert(identity.clone());
-                            }
-                        }
-                    }
-                    if let Some(values) = super::read_string_list(types, row) {
-                        for target in values {
-                            if type_targets.contains(&target) {
-                                type_referrers
-                                    .entry(target)
-                                    .or_default()
-                                    .insert(identity.clone());
-                            }
-                        }
-                    }
+            for edge in edges {
+                if self.workdir_is_dirty(&edge.caller_file_path)
+                    || self.workdir_is_deleted(&edge.caller_file_path)
+                {
+                    continue;
                 }
-            }
+                if !edge
+                    .caller_git_file_hashes
+                    .iter()
+                    .any(|h| manifest_hashes.contains(h))
+                {
+                    continue;
+                }
 
-            if !type_targets.is_empty() {
-                let types_table = self.connection.open_table("types").execute().await?;
-                let batches = types_table
-                    .query()
-                    .only_if("types IS NOT NULL")
-                    .select(lancedb::query::Select::Columns(vec![
-                        "name".to_string(),
-                        "file_path".to_string(),
-                        "git_file_hash".to_string(),
-                        "line".to_string(),
-                        "types".to_string(),
-                    ]))
-                    .execute()
-                    .await?
-                    .try_collect::<Vec<_>>()
-                    .await?;
+                // Distinct referring entity.  The scan this replaces keyed on
+                // path, line and name; line is not stored per edge, so two
+                // records of the same symbol in one file -- a declaration and
+                // its definition -- now count once rather than twice.
+                let identity = format!("{}:{}", edge.caller_file_path, edge.caller);
 
-                for batch in batches {
-                    let names: &StringArray = super::get_column(&batch, "name")?;
-                    let paths: &StringArray = super::get_column(&batch, "file_path")?;
-                    let hashes: &StringArray = super::get_column(&batch, "git_file_hash")?;
-                    let lines: &arrow::array::Int64Array = super::get_column(&batch, "line")?;
-                    let types: &ListArray = super::get_column(&batch, "types")?;
-
-                    for row in 0..batch.num_rows() {
-                        let path = paths.value(row);
-                        if self.workdir_is_dirty(path) || self.workdir_is_deleted(path) {
-                            continue;
-                        }
-                        if git_manifest.get(path).map(String::as_str) != Some(hashes.value(row)) {
-                            continue;
-                        }
-                        let identity =
-                            format!("type:{}:{}:{}", path, lines.value(row), names.value(row));
-                        if let Some(values) = super::read_string_list(types, row) {
-                            for target in values {
-                                if type_targets.contains(&target) {
-                                    type_referrers
-                                        .entry(target)
-                                        .or_default()
-                                        .insert(identity.clone());
-                                }
-                            }
-                        }
+                if edge.kind == crate::database::edges::KIND_CALL {
+                    if function_targets.contains(&edge.callee) {
+                        function_referrers
+                            .entry(edge.callee)
+                            .or_default()
+                            .insert(identity);
                     }
+                } else if type_targets.contains(&edge.callee) {
+                    type_referrers
+                        .entry(edge.callee)
+                        .or_default()
+                        .insert(identity);
                 }
             }
         }

@@ -26,22 +26,29 @@ use crate::database::connection::OPTIMAL_BATCH_SIZE;
 use crate::database::get_column;
 use crate::types::FunctionInfo;
 
-/// Relationship kind stored in the `kind` column.
+/// Relationship kinds stored in the `kind` column.
 ///
 /// A discriminator column rather than a table per relationship: `kind` is
 /// low-cardinality so it costs almost nothing, and every extra table
 /// multiplies per-fragment metadata across the whole database.
 pub const KIND_CALL: &str = "call";
+/// A function or type referencing a type. Both `functions.types` and
+/// `types.types` produce these; the referring entity is identified by
+/// (caller, caller_file_path) either way.
+pub const KIND_TYPE_USE: &str = "type_use";
 
 /// One reverse edge: `caller` references `callee`.
 #[derive(Debug, Clone)]
 pub struct CallEdge {
     pub callee: String,
     pub caller: String,
+    pub caller_file_path: String,
     /// Every blob hash this caller was seen in. Git-aware filtering asks
     /// whether any of them is present at the commit; the caller's path is not
     /// stored, since a hash match already means that content is present.
     pub caller_git_file_hashes: Vec<String>,
+    /// [`KIND_CALL`] or [`KIND_TYPE_USE`].
+    pub kind: String,
 }
 
 pub struct CallEdgeStore {
@@ -75,14 +82,38 @@ impl CallEdgeStore {
     pub async fn insert_from_functions(&self, functions: &[FunctionInfo]) -> Result<()> {
         let mut edges = Vec::new();
         for func in functions {
-            let Some(calls) = func.calls.as_ref() else {
-                continue;
-            };
-            for callee in calls {
+            let mut push = |callee: &String, kind: &str| {
                 edges.push(CallEdge {
                     callee: callee.clone(),
                     caller: func.name.clone(),
+                    caller_file_path: func.file_path.clone(),
                     caller_git_file_hashes: vec![func.git_file_hash.clone()],
+                    kind: kind.to_string(),
+                });
+            };
+            for callee in func.calls.iter().flatten() {
+                push(callee, KIND_CALL);
+            }
+            for referenced in func.types.iter().flatten() {
+                push(referenced, KIND_TYPE_USE);
+            }
+        }
+
+        self.insert_batch(edges).await
+    }
+
+    /// Type-to-type references, so "what references this type" is a lookup
+    /// rather than a scan of the types table.
+    pub async fn insert_from_types(&self, types: &[crate::types::TypeInfo]) -> Result<()> {
+        let mut edges = Vec::new();
+        for type_info in types {
+            for referenced in type_info.types.iter().flatten() {
+                edges.push(CallEdge {
+                    callee: referenced.clone(),
+                    caller: type_info.name.clone(),
+                    caller_file_path: type_info.file_path.clone(),
+                    caller_git_file_hashes: vec![type_info.git_file_hash.clone()],
+                    kind: KIND_TYPE_USE.to_string(),
                 });
             }
         }
@@ -113,24 +144,32 @@ impl CallEdgeStore {
         let mut seen = HashSet::new();
         let mut callee_builder = StringBuilder::new();
         let mut caller_builder = StringBuilder::new();
+        let mut path_builder = StringBuilder::new();
         let mut hashes_builder = arrow::array::ListBuilder::new(StringBuilder::new());
         let mut kind_builder = StringBuilder::new();
 
         // Indexing streams batches, so it writes one row per version here and
-        // the sort pass collapses them into one row per (callee, caller).
+        // the sort pass collapses them into one row per referring entity.
         for edge in edges {
             let hash = edge.caller_git_file_hashes.first().map(String::as_str);
-            let key = (edge.callee.as_str(), edge.caller.as_str(), hash);
+            let key = (
+                edge.callee.as_str(),
+                edge.caller.as_str(),
+                edge.caller_file_path.as_str(),
+                hash,
+                edge.kind.as_str(),
+            );
             if !seen.insert(key) {
                 continue;
             }
             callee_builder.append_value(&edge.callee);
             caller_builder.append_value(&edge.caller);
+            path_builder.append_value(&edge.caller_file_path);
             crate::database::append_string_list(
                 &mut hashes_builder,
                 Some(&edge.caller_git_file_hashes),
             );
-            kind_builder.append_value(KIND_CALL);
+            kind_builder.append_value(&edge.kind);
         }
 
         if seen.is_empty() {
@@ -140,6 +179,10 @@ impl CallEdgeStore {
         let batch = RecordBatch::try_from_iter(vec![
             ("callee", Arc::new(callee_builder.finish()) as ArrayRef),
             ("caller", Arc::new(caller_builder.finish()) as ArrayRef),
+            (
+                "caller_file_path",
+                Arc::new(path_builder.finish()) as ArrayRef,
+            ),
             (
                 "caller_git_file_hashes",
                 Arc::new(hashes_builder.finish()) as ArrayRef,
@@ -233,7 +276,7 @@ impl CallEdgeStore {
         // larger is better as long as the order across them is preserved.
         const FLUSH_ROWS: usize = 500_000;
         let mut first = true;
-        let mut buffer: Vec<(String, String, Vec<String>)> = Vec::new();
+        let mut buffer: Vec<(String, String, String, String, Vec<String>)> = Vec::new();
         let mut collapsed = 0usize;
 
         for (lo, hi) in &ranges {
@@ -246,16 +289,19 @@ impl CallEdgeStore {
             // a given callee falls in one partition, so grouping per partition
             // is complete.  A BTreeMap also yields the sort order for free.
             let mut grouped: std::collections::BTreeMap<
-                (String, String),
+                (String, String, String, String),
                 std::collections::BTreeSet<String>,
             > = std::collections::BTreeMap::new();
-            for (callee, caller, hash) in rows {
-                grouped.entry((callee, caller)).or_default().insert(hash);
+            for (callee, caller, path, kind, hash) in rows {
+                grouped
+                    .entry((callee, caller, path, kind))
+                    .or_default()
+                    .insert(hash);
             }
 
             collapsed += grouped.len();
-            for ((callee, caller), hashes) in grouped {
-                buffer.push((callee, caller, hashes.into_iter().collect()));
+            for ((callee, caller, path, kind), hashes) in grouped {
+                buffer.push((callee, caller, path, kind, hashes.into_iter().collect()));
             }
 
             if buffer.len() >= FLUSH_ROWS {
@@ -286,7 +332,7 @@ impl CallEdgeStore {
         table: &lancedb::table::Table,
         lo: &str,
         hi: Option<&str>,
-    ) -> Result<Vec<(String, String, String)>> {
+    ) -> Result<Vec<(String, String, String, String, String)>> {
         let filter = match hi {
             Some(hi) => format!("callee >= '{lo}' AND callee < '{hi}'"),
             None => format!("callee >= '{lo}'"),
@@ -303,6 +349,8 @@ impl CallEdgeStore {
         for batch in &batches {
             let callee: &StringArray = get_column(batch, "callee")?;
             let caller: &StringArray = get_column(batch, "caller")?;
+            let path: &StringArray = get_column(batch, "caller_file_path")?;
+            let kind: &StringArray = get_column(batch, "kind")?;
             let hashes: &arrow::array::ListArray = get_column(batch, "caller_git_file_hashes")?;
             for i in 0..batch.num_rows() {
                 let list = crate::database::read_string_list(hashes, i).unwrap_or_default();
@@ -310,6 +358,8 @@ impl CallEdgeStore {
                     rows.push((
                         callee.value(i).to_string(),
                         caller.value(i).to_string(),
+                        path.value(i).to_string(),
+                        kind.value(i).to_string(),
                         hash,
                     ));
                 }
@@ -323,7 +373,7 @@ impl CallEdgeStore {
     async fn flush_buffer(
         &self,
         table: &lancedb::table::Table,
-        buffer: &mut Vec<(String, String, Vec<String>)>,
+        buffer: &mut Vec<(String, String, String, String, Vec<String>)>,
         first: &mut bool,
     ) -> Result<()> {
         let mode = if *first {
@@ -341,11 +391,19 @@ impl CallEdgeStore {
     async fn append_sorted(
         &self,
         dst: &lancedb::table::Table,
-        rows: &[(String, String, String)],
+        rows: &[(String, String, String, String, String)],
     ) -> Result<()> {
-        let expanded: Vec<(String, String, Vec<String>)> = rows
+        let expanded: Vec<(String, String, String, String, Vec<String>)> = rows
             .iter()
-            .map(|(callee, caller, hash)| (callee.clone(), caller.clone(), vec![hash.clone()]))
+            .map(|(callee, caller, path, kind, hash)| {
+                (
+                    callee.clone(),
+                    caller.clone(),
+                    path.clone(),
+                    kind.clone(),
+                    vec![hash.clone()],
+                )
+            })
             .collect();
         self.write_rows(dst, &expanded, lancedb::table::AddDataMode::Append)
             .await
@@ -354,24 +412,27 @@ impl CallEdgeStore {
     async fn write_rows(
         &self,
         dst: &lancedb::table::Table,
-        rows: &[(String, String, Vec<String>)],
+        rows: &[(String, String, String, String, Vec<String>)],
         mode: lancedb::table::AddDataMode,
     ) -> Result<()> {
         let mut callee_b = StringBuilder::new();
         let mut caller_b = StringBuilder::new();
+        let mut path_b = StringBuilder::new();
         let mut hash_b = arrow::array::ListBuilder::new(StringBuilder::new());
         let mut kind_b = StringBuilder::new();
 
-        for (callee, caller, hashes) in rows {
+        for (callee, caller, path, kind, hashes) in rows {
             callee_b.append_value(callee);
             caller_b.append_value(caller);
+            path_b.append_value(path);
             crate::database::append_string_list(&mut hash_b, Some(hashes));
-            kind_b.append_value(KIND_CALL);
+            kind_b.append_value(kind);
         }
 
         let batch = RecordBatch::try_from_iter(vec![
             ("callee", Arc::new(callee_b.finish()) as ArrayRef),
             ("caller", Arc::new(caller_b.finish()) as ArrayRef),
+            ("caller_file_path", Arc::new(path_b.finish()) as ArrayRef),
             (
                 "caller_git_file_hashes",
                 Arc::new(hash_b.finish()) as ArrayRef,
@@ -384,6 +445,67 @@ impl CallEdgeStore {
     }
 
     /// Every edge pointing at `callee`. A BTree point lookup on the sorted key.
+    /// Every edge pointing at any of `callees`, in one query.
+    ///
+    /// The file survey asks about every symbol defined in a file at once.
+    /// Doing that as one range-scan per key over the sorted table beats
+    /// scanning `functions` and `types` end to end, and unlike a scan the cost
+    /// tracks the number of symbols asked about rather than the table size.
+    pub async fn find_referrers(&self, callees: &[String]) -> Result<Vec<CallEdge>> {
+        if callees.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let table = self.connection.open_table("call_edges").execute().await?;
+        let mut edges = Vec::new();
+
+        // Chunked so the filter string stays a sane size on a file that
+        // defines hundreds of symbols.
+        for chunk in callees.chunks(256) {
+            let list = chunk
+                .iter()
+                .map(|c| format!("'{}'", c.replace('\'', "''")))
+                .collect::<Vec<_>>()
+                .join(", ");
+
+            let batches = table
+                .query()
+                .only_if(format!("callee IN ({list})"))
+                .select(lancedb::query::Select::Columns(vec![
+                    "callee".to_string(),
+                    "caller".to_string(),
+                    "caller_file_path".to_string(),
+                    "caller_git_file_hashes".to_string(),
+                    "kind".to_string(),
+                ]))
+                .execute()
+                .await?
+                .try_collect::<Vec<_>>()
+                .await?;
+
+            for batch in &batches {
+                let callees_col: &StringArray = get_column(batch, "callee")?;
+                let callers: &StringArray = get_column(batch, "caller")?;
+                let paths: &StringArray = get_column(batch, "caller_file_path")?;
+                let kinds: &StringArray = get_column(batch, "kind")?;
+                let hashes: &arrow::array::ListArray = get_column(batch, "caller_git_file_hashes")?;
+
+                for row in 0..batch.num_rows() {
+                    edges.push(CallEdge {
+                        callee: callees_col.value(row).to_string(),
+                        caller: callers.value(row).to_string(),
+                        caller_file_path: paths.value(row).to_string(),
+                        caller_git_file_hashes: crate::database::read_string_list(hashes, row)
+                            .unwrap_or_default(),
+                        kind: kinds.value(row).to_string(),
+                    });
+                }
+            }
+        }
+
+        Ok(edges)
+    }
+
     pub async fn find_callers(&self, callee: &str) -> Result<Vec<CallEdge>> {
         let table = self.connection.open_table("call_edges").execute().await?;
         let escaped = callee.replace('\'', "''");
@@ -393,6 +515,8 @@ impl CallEdgeStore {
             .only_if(format!("callee = '{escaped}' AND kind = '{KIND_CALL}'"))
             // `callee` is already known; not reading it back keeps the Take
             // narrow, which is the whole point of this table.
+            // caller_file_path is deliberately not selected: a columnar read
+            // does not pay for a column it does not project.
             .select(lancedb::query::Select::Columns(vec![
                 "caller".to_string(),
                 "caller_git_file_hashes".to_string(),
@@ -411,8 +535,10 @@ impl CallEdgeStore {
                 edges.push(CallEdge {
                     callee: callee.to_string(),
                     caller: callers.value(row).to_string(),
+                    caller_file_path: String::new(),
                     caller_git_file_hashes: crate::database::read_string_list(hashes, row)
                         .unwrap_or_default(),
+                    kind: KIND_CALL.to_string(),
                 });
             }
         }
