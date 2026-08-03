@@ -36,3 +36,6 @@ Thumbs.db
 
 # claude
 .claude
+
+# Generated benchmark corpora (see scripts/gen-bench-corpus.py)
+/semcode-bench-*/
