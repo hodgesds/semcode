@@ -76,5 +76,17 @@ path = "src/bin/semcode-mcp.rs"
 name = "semcode-lsp"
 path = "src/bin/semcode-lsp.rs"
 
+[dev-dependencies]
+# Benchmark harness.  Default features pull in plotters, which is only used by
+# the (non-default) html_reports feature, so they are turned off.
+criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
+
+# Query benchmarks against a prebuilt database (SEMCODE_BENCH_DB).
+# test = false keeps the pre-commit `cargo test` hook from touching them.
+[[bench]]
+name = "query"
+harness = false
+test = false
+
 [profile.release]
 debug = false
