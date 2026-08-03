@@ -1079,6 +1079,13 @@ pub async fn process_git_tree(
     println!("Functions indexed: {}", stats.functions_count);
     println!("Types indexed: {}", stats.types_count);
 
+    // Indices only cover rows that existed when they were built, so refresh
+    // them unconditionally.  This is separate from the health check below,
+    // which is about fragment counts and may well decide to do nothing.
+    if let Err(e) = db_manager.optimize_scalar_indices().await {
+        error!("Failed to refresh scalar indices: {}", e);
+    }
+
     // Check if optimization is needed
     match db_manager.check_optimization_health().await {
         Ok((needs_optimization, message)) => {
@@ -1243,6 +1250,11 @@ pub async fn process_git_range(
     info!("Files processed: {}", stats.files_processed);
     info!("Functions indexed: {}", stats.functions_count);
     info!("Types indexed: {}", stats.types_count);
+
+    // Refresh indices over the rows just written (see index_git_tree).
+    if let Err(e) = db_manager.optimize_scalar_indices().await {
+        error!("Failed to refresh scalar indices: {}", e);
+    }
 
     // Check if optimization is needed after git range indexing
     match db_manager.check_optimization_health().await {

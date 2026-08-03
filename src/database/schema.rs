@@ -522,6 +522,48 @@ impl SchemaManager {
             }
         }
 
+        self.create_scalar_indices_now(&table_names).await
+    }
+
+    /// Bring every scalar index up to date with the rows currently in the table.
+    ///
+    /// An index only covers the rows that existed when it was built.  Because
+    /// `create_scalar_indices` runs from `create_tables` -- when the tables are
+    /// still empty -- and then early-returns on every later run, indices were
+    /// being created over zero rows and never refreshed.  The planner silently
+    /// falls back to a full scan in that state, so every query paid a scan
+    /// while the indices sat empty on disk.
+    ///
+    /// Run this after indexing.  It is cheap: ~0.7s for 144k functions.
+    pub async fn optimize_scalar_indices(&self) -> Result<()> {
+        let table_names = self.connection.table_names().execute().await?;
+
+        // Create anything missing first: a column that gained an index after
+        // the database was built would otherwise never get one, since the
+        // creation path above has already early-returned.
+        self.create_scalar_indices_now(&table_names).await?;
+
+        // Indices are refreshed independently of compaction and pruning.  Those
+        // are gated on fragment counts and rewrite data files; this only needs
+        // to happen because rows were appended.
+        for table_name in ["functions", "types", "macros", "content", "git_commits"] {
+            if !table_names.iter().any(|n| n == table_name) {
+                continue;
+            }
+            let table = self.connection.open_table(table_name).execute().await?;
+            match table
+                .optimize(lancedb::table::OptimizeAction::Index(Default::default()))
+                .await
+            {
+                Ok(_) => tracing::info!("Refreshed scalar indices for table {}", table_name),
+                Err(e) => tracing::warn!("Failed to refresh indices for {}: {}", table_name, e),
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn create_scalar_indices_now(&self, table_names: &[String]) -> Result<()> {
         tracing::info!("Creating database indices (first time or small database)...");
 
         // Create indices for functions table

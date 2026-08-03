@@ -508,6 +508,12 @@ impl DatabaseManager {
         self.schema_manager.optimize_tables().await
     }
 
+    /// Make the scalar indices cover the rows that were just written.
+    /// Must run after indexing, or queries fall back to full scans.
+    pub async fn optimize_scalar_indices(&self) -> Result<()> {
+        self.schema_manager.optimize_scalar_indices().await
+    }
+
     pub async fn compact_and_cleanup(&self) -> Result<()> {
         self.schema_manager.compact_and_cleanup().await
     }
