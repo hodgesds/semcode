@@ -925,6 +925,13 @@ impl DatabaseManager {
         let results = table
             .query()
             .only_if(format!("name = '{escaped_name}'"))
+            .select(lancedb::query::Select::Columns(vec![
+                "file_path".to_string(),
+                "git_file_hash".to_string(),
+                "line_start".to_string(),
+                "line_end".to_string(),
+                "types".to_string(),
+            ]))
             .execute()
             .await?
             .try_collect::<Vec<_>>()
@@ -935,39 +942,13 @@ impl DatabaseManager {
 
         for batch in results {
             if batch.num_rows() > 0 {
-                let file_path_array = batch
-                    .column(1)
-                    .as_any()
-                    .downcast_ref::<arrow::array::StringArray>()
-                    .unwrap();
-                let git_file_hash_array = batch
-                    .column(2)
-                    .as_any()
-                    .downcast_ref::<arrow::array::StringArray>()
-                    .unwrap();
-                let line_start_array = batch
-                    .column(3)
-                    .as_any()
-                    .downcast_ref::<arrow::array::Int64Array>()
-                    .unwrap();
-                let line_end_array = batch
-                    .column(4)
-                    .as_any()
-                    .downcast_ref::<arrow::array::Int64Array>()
-                    .unwrap();
-
-                // Find the types column
-                let types_column_idx = batch
-                    .schema()
-                    .fields()
-                    .iter()
-                    .position(|f| f.name() == "types")
-                    .ok_or_else(|| anyhow::anyhow!("types column not found in functions table"))?;
-                let types_array = batch
-                    .column(types_column_idx)
-                    .as_any()
-                    .downcast_ref::<arrow::array::ListArray>()
-                    .ok_or_else(|| anyhow::anyhow!("types column is not a list"))?;
+                let file_path_array: &StringArray = super::get_column(&batch, "file_path")?;
+                let git_file_hash_array: &StringArray = super::get_column(&batch, "git_file_hash")?;
+                let line_start_array: &arrow::array::Int64Array =
+                    super::get_column(&batch, "line_start")?;
+                let line_end_array: &arrow::array::Int64Array =
+                    super::get_column(&batch, "line_end")?;
+                let types_array: &ListArray = super::get_column(&batch, "types")?;
 
                 for i in 0..batch.num_rows() {
                     let file_path = file_path_array.value(i);
@@ -3794,9 +3775,20 @@ impl DatabaseManager {
         let escaped_name = function_name.replace("'", "''");
         let table = self.connection.open_table("functions").execute().await?;
 
+        // Project to the five columns this reads.  Without it every version of
+        // the symbol is materialized in full -- ten columns including both
+        // relationship lists and the parameter JSON -- and a symbol has one row
+        // per commit that touched its file, so the waste scales with history.
         let results = table
             .query()
             .only_if(format!("name = '{escaped_name}'"))
+            .select(lancedb::query::Select::Columns(vec![
+                "file_path".to_string(),
+                "git_file_hash".to_string(),
+                "line_start".to_string(),
+                "line_end".to_string(),
+                "calls".to_string(),
+            ]))
             .execute()
             .await?
             .try_collect::<Vec<_>>()
@@ -3807,39 +3799,15 @@ impl DatabaseManager {
 
         for batch in results {
             if batch.num_rows() > 0 {
-                let file_path_array = batch
-                    .column(1)
-                    .as_any()
-                    .downcast_ref::<arrow::array::StringArray>()
-                    .unwrap();
-                let git_file_hash_array = batch
-                    .column(2)
-                    .as_any()
-                    .downcast_ref::<arrow::array::StringArray>()
-                    .unwrap();
-                let line_start_array = batch
-                    .column(3)
-                    .as_any()
-                    .downcast_ref::<arrow::array::Int64Array>()
-                    .unwrap();
-                let line_end_array = batch
-                    .column(4)
-                    .as_any()
-                    .downcast_ref::<arrow::array::Int64Array>()
-                    .unwrap();
-
-                // Find the calls column
-                let calls_column_idx = batch
-                    .schema()
-                    .fields()
-                    .iter()
-                    .position(|f| f.name() == "calls")
-                    .ok_or_else(|| anyhow::anyhow!("calls column not found in functions table"))?;
-                let calls_array = batch
-                    .column(calls_column_idx)
-                    .as_any()
-                    .downcast_ref::<arrow::array::ListArray>()
-                    .ok_or_else(|| anyhow::anyhow!("calls column is not a list"))?;
+                // By name, not position: the projection above sets the column
+                // order, so positional access reads the wrong column.
+                let file_path_array: &StringArray = super::get_column(&batch, "file_path")?;
+                let git_file_hash_array: &StringArray = super::get_column(&batch, "git_file_hash")?;
+                let line_start_array: &arrow::array::Int64Array =
+                    super::get_column(&batch, "line_start")?;
+                let line_end_array: &arrow::array::Int64Array =
+                    super::get_column(&batch, "line_end")?;
+                let calls_array: &ListArray = super::get_column(&batch, "calls")?;
 
                 for i in 0..batch.num_rows() {
                     let file_path = file_path_array.value(i);
@@ -3892,10 +3860,17 @@ impl DatabaseManager {
         let start = std::time::Instant::now();
         let table = self.connection.open_table("functions").execute().await?;
 
-        // Query all functions that have calls (one scan)
+        // Whole-table scan, so projection matters more here than anywhere:
+        // without it this reads every column of every function version.
         let results = table
             .query()
             .only_if("calls IS NOT NULL")
+            .select(lancedb::query::Select::Columns(vec![
+                "name".to_string(),
+                "file_path".to_string(),
+                "git_file_hash".to_string(),
+                "calls".to_string(),
+            ]))
             .execute()
             .await?
             .try_collect::<Vec<_>>()
@@ -3906,21 +3881,9 @@ impl DatabaseManager {
 
         for batch in results {
             if batch.num_rows() > 0 {
-                let name_array = batch
-                    .column(0)
-                    .as_any()
-                    .downcast_ref::<arrow::array::StringArray>()
-                    .unwrap();
-                let file_path_array = batch
-                    .column(1)
-                    .as_any()
-                    .downcast_ref::<arrow::array::StringArray>()
-                    .unwrap();
-                let git_file_hash_array = batch
-                    .column(2)
-                    .as_any()
-                    .downcast_ref::<arrow::array::StringArray>()
-                    .unwrap();
+                let name_array: &StringArray = super::get_column(&batch, "name")?;
+                let file_path_array: &StringArray = super::get_column(&batch, "file_path")?;
+                let git_file_hash_array: &StringArray = super::get_column(&batch, "git_file_hash")?;
 
                 let calls_column_idx = batch
                     .schema()
